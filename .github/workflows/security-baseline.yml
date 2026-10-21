@@ -344,12 +344,14 @@ jobs:
           DOCKERFILE: ${{ inputs.dockerfile }}
           CONTEXT: ${{ inputs.docker-context }}
           BUILD_ARGS: ${{ inputs.docker-build-args }}
+          # A self-hosted runner may start jobs without a usable TMPDIR; podman and bash both need one.
+          TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
           args=(build --pull -t "$IMAGE" -f "$DOCKERFILE")
           while IFS= read -r line; do
             if [ -n "$line" ]; then args+=(--build-arg "$line"); fi
-          done <<< "$BUILD_ARGS"
+          done < <(printf '%s\n' "$BUILD_ARGS")
           docker "${args[@]}" "$CONTEXT"
       - name: Record the scanned platform
         # The Spark runner builds linux/arm64 with no x86 emulation, so there the SBOM and the image scan
@@ -359,6 +361,8 @@ jobs:
           echo "Image built and scanned on $(uname -m) (runner arch $RUNNER_ARCH). The SBOM describes that platform." \
             >> "$GITHUB_STEP_SUMMARY"
       - name: Write the SBOM
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: '"$RUNNER_TEMP/trivy" image --format cyclonedx --output "$RUNNER_TEMP/sbom.cdx.json" "$IMAGE"'
       - name: Upload the SBOM
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -371,6 +375,7 @@ jobs:
         # Runs after the SBOM upload, so a failing scan still leaves the SBOM behind.
         env:
           SEVERITY: ${{ inputs.severity }}
+          TMPDIR: ${{ runner.temp }}
         run: |
           "$RUNNER_TEMP/trivy" image --scanners vuln --severity "$SEVERITY" --ignore-unfixed \
             --exit-code 1 "$IMAGE"
