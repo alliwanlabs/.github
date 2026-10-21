@@ -48,6 +48,10 @@ on:
         description: Semgrep rule set or config path.
         type: string
         default: p/default
+      semgrep-exclude-rules:
+        description: Semgrep rule IDs to skip, one per line. The default skips a Python 3.7 compatibility rule that is not a security check.
+        type: string
+        default: python.lang.compatibility.python37.python37-compatibility-importlib2
       semgrep-severity:
         description: Lowest Semgrep severity that fails the check (INFO, WARNING or ERROR).
         type: string
@@ -179,13 +183,24 @@ jobs:
           CONFIG: ${{ inputs.gitleaks-config }}
         run: |
           set -euo pipefail
-          args=(git --no-banner --redact=100)
-          if [ -n "$CONFIG" ]; then
-            args+=(--config "$CONFIG")
-          elif [ -f .gitleaks.toml ]; then
-            args+=(--config .gitleaks.toml)
+          if [ -z "$CONFIG" ] && [ -f .gitleaks.toml ]; then CONFIG=.gitleaks.toml; fi
+          if [ -z "$CONFIG" ]; then
+            # Org default: the standard rules, plus the one false positive every app with a vendored
+            # kit copy shares. VENDORED.json lists SHA-256 hashes of the vendored files.
+            CONFIG="$RUNNER_TEMP/gitleaks.toml"
+            cat > "$CONFIG" <<'TOML'
+          [extend]
+          useDefault = true
+
+          [[allowlists]]
+          description = "VENDORED.json lists SHA-256 hashes of vendored kit files, not credentials"
+          condition = "AND"
+          paths = ['(^|/)VENDORED\.json$']
+          regexTarget = "secret"
+          regexes = ['^[0-9a-f]{64}$']
+          TOML
           fi
-          "$RUNNER_TEMP/gitleaks" "${args[@]}" .
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact=100 --config "$CONFIG" .
 
   osv:
     name: Dependencies (osv-scanner)
@@ -210,7 +225,9 @@ jobs:
         # osv-scanner.toml next to the lockfile. A repository with no lockfile passes.
         env:
           SCAN_PATH: ${{ inputs.path }}
-        run: '"$RUNNER_TEMP/osv-scanner" scan source --recursive --allow-no-lockfiles "$SCAN_PATH"'
+        # --no-resolve keeps the scan to versions written in the repository: resolving a version range
+        # in a requirements file picks a version that may never be installed.
+        run: '"$RUNNER_TEMP/osv-scanner" scan source --recursive --allow-no-lockfiles --no-resolve "$SCAN_PATH"'
 
   semgrep:
     name: Static analysis (Semgrep)
@@ -231,8 +248,13 @@ jobs:
           SCAN_PATH: ${{ inputs.path }}
           CONFIG: ${{ inputs.semgrep-config }}
           SEVERITY: ${{ inputs.semgrep-severity }}
+          EXCLUDE_RULES: ${{ inputs.semgrep-exclude-rules }}
         run: |
           set -euo pipefail
+          excludes=()
+          while IFS= read -r rule; do
+            if [ -n "$rule" ]; then excludes+=(--exclude-rule "$rule"); fi
+          done <<< "$EXCLUDE_RULES"
           case "$SEVERITY" in
             INFO) levels=(--severity INFO --severity WARNING --severity ERROR) ;;
             WARNING) levels=(--severity WARNING --severity ERROR) ;;
@@ -240,7 +262,7 @@ jobs:
             *) echo "::error::semgrep-severity must be INFO, WARNING or ERROR, not '$SEVERITY'"; exit 1 ;;
           esac
           docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
-            semgrep scan --config "$CONFIG" --metrics=off --error "${levels[@]}" "$SCAN_PATH"
+            semgrep scan --config "$CONFIG" --metrics=off --error "${levels[@]}" "${excludes[@]}" "$SCAN_PATH"
 
   trivy-fs:
     name: Filesystem (Trivy)
