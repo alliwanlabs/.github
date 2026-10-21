@@ -9,7 +9,8 @@ name: Security baseline
 #     baseline:
 #       uses: alliwanlabs/.github/.github/workflows/security-baseline.yml@main
 #
-# Light scans run on every pull request: gitleaks (secrets, whole history), osv-scanner (known
+# Light scans run on every pull request, on schedule and on manual runs (a push to the default branch
+# already passed them as a pull request; gitleaks still runs on every push): gitleaks (secrets, whole history), osv-scanner (known
 # vulnerabilities in lockfiles), Semgrep Community rules (p/default) and a Trivy filesystem scan
 # (vulnerabilities and misconfiguration). Heavy scans (image build, Trivy image scan and a CycloneDX
 # SBOM uploaded as an artifact) run only when the repository has a Dockerfile, and then only on a
@@ -84,6 +85,10 @@ on:
         description: Trivy severities that fail the check.
         type: string
         default: HIGH,CRITICAL
+      runner:
+        description: Runner label for every job. A self-hosted label avoids billed GitHub-hosted minutes.
+        type: string
+        default: ubuntu-latest
       sbom-artifact-name:
         description: Name of the uploaded SBOM artifact.
         type: string
@@ -102,7 +107,8 @@ env:
 jobs:
   plan:
     name: Plan
-    runs-on: ubuntu-latest
+    if: inputs.image
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -159,7 +165,7 @@ jobs:
   gitleaks:
     name: Secrets (gitleaks)
     if: inputs.gitleaks
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -204,8 +210,8 @@ jobs:
 
   osv:
     name: Dependencies (osv-scanner)
-    if: inputs.osv
-    runs-on: ubuntu-latest
+    if: inputs.osv && github.event_name != 'push'
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -231,8 +237,8 @@ jobs:
 
   semgrep:
     name: Static analysis (Semgrep)
-    if: inputs.semgrep
-    runs-on: ubuntu-latest
+    if: inputs.semgrep && github.event_name != 'push'
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -266,8 +272,8 @@ jobs:
 
   trivy-fs:
     name: Filesystem (Trivy)
-    if: inputs.trivy-fs
-    runs-on: ubuntu-latest
+    if: inputs.trivy-fs && github.event_name != 'push'
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -297,7 +303,7 @@ jobs:
     name: Image and SBOM (Trivy)
     needs: plan
     if: inputs.image && needs.plan.outputs.dockerfile == 'true' && needs.plan.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 25
     permissions:
       contents: read
