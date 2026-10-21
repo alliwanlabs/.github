@@ -10,12 +10,13 @@ name: Security baseline
 #       uses: alliwanlabs/.github/.github/workflows/security-baseline.yml@main
 #
 # Light scans run on every pull request, on schedule and on manual runs (a push to the default branch
-# already passed them as a pull request; gitleaks still runs on every push): gitleaks (secrets, whole history), osv-scanner (known
-# vulnerabilities in lockfiles), Semgrep Community rules (p/default) and a Trivy filesystem scan
-# (vulnerabilities and misconfiguration). Heavy scans (image build, Trivy image scan and a CycloneDX
-# SBOM uploaded as an artifact) run only when the repository has a Dockerfile, and then only on a
-# push to the default branch, on schedule or manual runs, and on pull requests that change a
-# Dockerfile, a manifest or a lockfile.
+# already passed them as a pull request; gitleaks still runs on every push): gitleaks (secrets, whole
+# history), osv-scanner (known vulnerabilities in lockfiles), Semgrep Community rules (p/default) and
+# a Trivy filesystem scan (vulnerabilities and misconfiguration). Heavy scans (image build, Trivy
+# image scan and a CycloneDX SBOM uploaded as an artifact, on the self-hosted Spark scan runner by
+# default) run only when the repository has a Dockerfile, and then only on a push to the default
+# branch, on schedule or manual runs, and on pull requests that change a Dockerfile, a manifest or a
+# lockfile.
 #
 # Every scanner is a released binary or image pinned by version and SHA-256, checked before it runs.
 # gitleaks/gitleaks-action is not used: it refuses to run on an organisation repository without a
@@ -89,6 +90,13 @@ on:
         description: Runner label for every job. A self-hosted label avoids billed GitHub-hosted minutes.
         type: string
         default: ubuntu-latest
+      heavy-runner:
+        description: >-
+          Runner for the image job, as JSON: a label string or a list of labels. Empty uses the organisation or
+          repository variable LABS_SCAN_RUNNER when set, else the Spark scan runner ["self-hosted","spark","scan"].
+          Set it (or LABS_SCAN_RUNNER) to "ubuntu-latest" to fall back to GitHub-hosted.
+        type: string
+        default: ""
       sbom-artifact-name:
         description: Name of the uploaded SBOM artifact.
         type: string
@@ -101,6 +109,7 @@ env:
   OSV_SCANNER_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
   TRIVY_VERSION: 0.76.0
   TRIVY_SHA256: e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7
+  TRIVY_ARM64_SHA256: aab21e677a7b7071fc79f1711480840754c18a1b9d9cefa7ccd06af63a0e8f4c
   # semgrep/semgrep:1.180.0, multi-architecture index digest.
   SEMGREP_IMAGE: semgrep/semgrep@sha256:529ee8a277ec8adc5b534d7c74eea0a47e9de21d62852b6ba7ac6ba9566845c3
 
@@ -303,10 +312,16 @@ jobs:
     name: Image and SBOM (Trivy)
     needs: plan
     if: inputs.image && needs.plan.outputs.dockerfile == 'true' && needs.plan.outputs.heavy == 'true'
-    runs-on: ${{ inputs.runner }}
+    # Heavy job: runs on the self-hosted Spark scan runner by default, so it uses no billed minutes. Actions has
+    # no automatic fallback when a self-hosted runner is offline (the job waits in the queue), so the fallback is
+    # a switch: LABS_SCAN_RUNNER or the heavy-runner input set to "ubuntu-latest".
+    runs-on: ${{ fromJSON(inputs.heavy-runner != '' && inputs.heavy-runner || (vars.LABS_SCAN_RUNNER != '' && vars.LABS_SCAN_RUNNER || '["self-hosted","spark","scan"]')) }}
     timeout-minutes: 25
     permissions:
       contents: read
+    env:
+      # Unique per run: a self-hosted runner keeps images between jobs.
+      IMAGE: security-baseline-${{ github.run_id }}-${{ github.run_attempt }}:scan
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -314,10 +329,15 @@ jobs:
       - name: Install Trivy
         run: |
           set -euo pipefail
-          archive="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          # The Spark runner is ARM64; GitHub-hosted runners are x64.
+          case "$(uname -m)" in
+            x86_64) archive="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"; sum="$TRIVY_SHA256" ;;
+            aarch64|arm64) archive="trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"; sum="$TRIVY_ARM64_SHA256" ;;
+            *) echo "::error::no pinned Trivy build for $(uname -m)"; exit 1 ;;
+          esac
           curl -fsSL -o "$RUNNER_TEMP/$archive" \
             "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${archive}"
-          echo "${TRIVY_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum -c -
+          echo "${sum}  $RUNNER_TEMP/${archive}" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" trivy
       - name: Build the image
         env:
@@ -326,13 +346,13 @@ jobs:
           BUILD_ARGS: ${{ inputs.docker-build-args }}
         run: |
           set -euo pipefail
-          args=(build --pull -t security-baseline:scan -f "$DOCKERFILE")
+          args=(build --pull -t "$IMAGE" -f "$DOCKERFILE")
           while IFS= read -r line; do
             if [ -n "$line" ]; then args+=(--build-arg "$line"); fi
           done <<< "$BUILD_ARGS"
           docker "${args[@]}" "$CONTEXT"
       - name: Write the SBOM
-        run: '"$RUNNER_TEMP/trivy" image --format cyclonedx --output "$RUNNER_TEMP/sbom.cdx.json" security-baseline:scan'
+        run: '"$RUNNER_TEMP/trivy" image --format cyclonedx --output "$RUNNER_TEMP/sbom.cdx.json" "$IMAGE"'
       - name: Upload the SBOM
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -346,4 +366,7 @@ jobs:
           SEVERITY: ${{ inputs.severity }}
         run: |
           "$RUNNER_TEMP/trivy" image --scanners vuln --severity "$SEVERITY" --ignore-unfixed \
-            --exit-code 1 security-baseline:scan
+            --exit-code 1 "$IMAGE"
+      - name: Remove the image
+        if: always()
+        run: docker image rm -f "$IMAGE" >/dev/null 2>&1 || true

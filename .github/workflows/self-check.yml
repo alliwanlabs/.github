@@ -52,6 +52,8 @@ jobs:
       dockerfile: tests/baseline-fixture/Dockerfile
       docker-context: tests/baseline-fixture
       heavy: always
+      # This repository is public: its jobs never run on the self-hosted Spark runner.
+      heavy-runner: '"ubuntu-latest"'
       sbom-artifact-name: sbom-fixture
 
   defaults:
