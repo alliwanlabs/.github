@@ -1,0 +1,80 @@
+name: Self-check
+
+# Proves the shared security baseline runs: lints every workflow in this repository, runs the
+# baseline with heavy scans forced on a small fixture (image build, image scan, SBOM), runs it again
+# with the defaults a caller gets, and checks the SBOM artifact is a CycloneDX document.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: 1.7.12
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+
+jobs:
+  actionlint:
+    name: Lint workflows (actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
+      - name: Lint
+        run: '"$RUNNER_TEMP/actionlint" .github/workflows/*.yml workflow-templates/*.yml'
+
+  fixture:
+    name: Baseline on the fixture, heavy scans forced
+    uses: ./.github/workflows/security-baseline.yml
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      path: tests/baseline-fixture
+      dockerfile: tests/baseline-fixture/Dockerfile
+      docker-context: tests/baseline-fixture
+      heavy: always
+      # This repository is public: its jobs never run on the self-hosted Spark runner.
+      heavy-runner: '"ubuntu-latest"'
+      sbom-artifact-name: sbom-fixture
+
+  defaults:
+    name: Baseline with caller defaults
+    uses: ./.github/workflows/security-baseline.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  sbom:
+    name: SBOM is CycloneDX
+    needs: fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom-fixture
+          path: sbom
+      - name: Check the document
+        run: |
+          set -euo pipefail
+          jq -e '.bomFormat == "CycloneDX" and (.specVersion | length > 0) and (.metadata.component.name | length > 0)' \
+            sbom/sbom.cdx.json

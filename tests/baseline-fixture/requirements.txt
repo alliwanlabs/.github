@@ -1,0 +1,2 @@
+# One pinned package with no known advisories, so osv-scanner and Trivy have a lockfile to read.
+six==1.17.0

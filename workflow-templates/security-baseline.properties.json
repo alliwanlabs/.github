@@ -1,0 +1,6 @@
+{
+  "name": "Al Liwan Labs security baseline",
+  "description": "gitleaks, osv-scanner, Semgrep Community and Trivy on every pull request; image scan and SBOM when the repository has a Dockerfile.",
+  "iconName": "security-baseline",
+  "categories": ["Security"]
+}

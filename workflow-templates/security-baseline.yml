@@ -1,0 +1,21 @@
+name: Security baseline
+
+on:
+  pull_request:
+  push:
+    branches: [$default-branch]
+  schedule:
+    - cron: '30 5 * * 1'  # weekly, catches advisories published after a merge
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: security-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    uses: alliwanlabs/.github/.github/workflows/security-baseline.yml@main

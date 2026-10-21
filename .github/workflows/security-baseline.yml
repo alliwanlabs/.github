@@ -1,0 +1,388 @@
+name: Security baseline
+
+# Shared security checks for every Al Liwan Labs repository that holds code (suite plan item 1.1,
+# Phase 1: free tools only, no CodeQL and no GitHub Code Security).
+#
+# A repository calls this workflow from a small caller, for example:
+#
+#   jobs:
+#     baseline:
+#       uses: alliwanlabs/.github/.github/workflows/security-baseline.yml@main
+#
+# Light scans run on every pull request, on schedule and on manual runs (a push to the default branch
+# already passed them as a pull request; gitleaks still runs on every push): gitleaks (secrets, whole
+# history), osv-scanner (known vulnerabilities in lockfiles), Semgrep Community rules (p/default) and
+# a Trivy filesystem scan (vulnerabilities and misconfiguration). Heavy scans (image build, Trivy
+# image scan and a CycloneDX SBOM uploaded as an artifact, on the self-hosted Spark scan runner by
+# default) run only when the repository has a Dockerfile, and then only on a push to the default
+# branch, on schedule or manual runs, and on pull requests that change a Dockerfile, a manifest or a
+# lockfile.
+#
+# Every scanner is a released binary or image pinned by version and SHA-256, checked before it runs.
+# gitleaks/gitleaks-action is not used: it refuses to run on an organisation repository without a
+# paid licence. The only actions used are actions/checkout and actions/upload-artifact, pinned by
+# commit SHA. Pins verified against the upstream release checksums on 21 October 2026.
+
+on:
+  workflow_call:
+    inputs:
+      path:
+        description: Directory the osv-scanner, Semgrep and Trivy filesystem scans read, relative to the repository root.
+        type: string
+        default: "."
+      gitleaks:
+        description: Run the gitleaks secret scan.
+        type: boolean
+        default: true
+      gitleaks-config:
+        description: gitleaks config file. Empty uses .gitleaks.toml when the repository has one, else the default rules.
+        type: string
+        default: ""
+      osv:
+        description: Run osv-scanner on lockfiles.
+        type: boolean
+        default: true
+      semgrep:
+        description: Run Semgrep Community rules.
+        type: boolean
+        default: true
+      semgrep-config:
+        description: Semgrep rule set or config path.
+        type: string
+        default: p/default
+      semgrep-exclude-rules:
+        description: Semgrep rule IDs to skip, one per line. The default skips a Python 3.7 compatibility rule that is not a security check.
+        type: string
+        default: python.lang.compatibility.python37.python37-compatibility-importlib2
+      semgrep-severity:
+        description: Lowest Semgrep severity that fails the check (INFO, WARNING or ERROR).
+        type: string
+        default: ERROR
+      trivy-fs:
+        description: Run the Trivy filesystem scan.
+        type: boolean
+        default: true
+      image:
+        description: Build the image and run the Trivy image scan and SBOM when a Dockerfile exists.
+        type: boolean
+        default: true
+      dockerfile:
+        description: Dockerfile path, relative to the repository root.
+        type: string
+        default: Dockerfile
+      docker-context:
+        description: Docker build context, relative to the repository root.
+        type: string
+        default: "."
+      docker-build-args:
+        description: Extra build arguments, one KEY=VALUE per line. Never put secrets here.
+        type: string
+        default: ""
+      heavy:
+        description: When to run the heavy scans. auto, always or never.
+        type: string
+        default: auto
+      severity:
+        description: Trivy severities that fail the check.
+        type: string
+        default: HIGH,CRITICAL
+      runner:
+        description: Runner label for every job. A self-hosted label avoids billed GitHub-hosted minutes.
+        type: string
+        default: ubuntu-latest
+      heavy-runner:
+        description: >-
+          Runner for the image job, as JSON: a label string or a list of labels. Empty uses the organisation or
+          repository variable LABS_SCAN_RUNNER when set, else the Spark scan runner ["self-hosted","spark","scan"].
+          Set it (or LABS_SCAN_RUNNER) to "ubuntu-latest" to fall back to GitHub-hosted.
+        type: string
+        default: ""
+      sbom-artifact-name:
+        description: Name of the uploaded SBOM artifact.
+        type: string
+        default: sbom
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  OSV_SCANNER_VERSION: 2.7.0
+  OSV_SCANNER_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+  TRIVY_VERSION: 0.76.0
+  TRIVY_SHA256: e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7
+  TRIVY_ARM64_SHA256: aab21e677a7b7071fc79f1711480840754c18a1b9d9cefa7ccd06af63a0e8f4c
+  # semgrep/semgrep:1.180.0, multi-architecture index digest.
+  SEMGREP_IMAGE: semgrep/semgrep@sha256:529ee8a277ec8adc5b534d7c74eea0a47e9de21d62852b6ba7ac6ba9566845c3
+
+jobs:
+  plan:
+    name: Plan
+    if: inputs.image
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      heavy: ${{ steps.plan.outputs.heavy }}
+      dockerfile: ${{ steps.plan.outputs.dockerfile }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Decide which scans run
+        id: plan
+        env:
+          MODE: ${{ inputs.heavy }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -f "$DOCKERFILE" ]; then dockerfile=true; else dockerfile=false; fi
+
+          # Dockerfiles, manifests and lockfiles: a change to any of them can change the image.
+          pattern='(^|/)(Dockerfile[^/]*|\.dockerignore|package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|requirements[^/]*\.(txt|lock)|[^/]*\.lock|pyproject\.toml|pylock[^/]*\.toml|go\.(mod|sum))$'
+          case "$MODE" in
+            always) heavy=true ;;
+            never) heavy=false ;;
+            auto)
+              case "$EVENT" in
+                pull_request|pull_request_target)
+                  if gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' | grep -Eq "$pattern"; then
+                    heavy=true
+                  else
+                    heavy=false
+                  fi
+                  ;;
+                push)
+                  if [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then heavy=true; else heavy=false; fi
+                  ;;
+                *) heavy=true ;;
+              esac
+              ;;
+            *) echo "::error::heavy must be auto, always or never, not '$MODE'"; exit 1 ;;
+          esac
+
+          echo "heavy=$heavy" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+          echo "Event $EVENT on $REF. Dockerfile present: $dockerfile. Heavy scans: $heavy." >> "$GITHUB_STEP_SUMMARY"
+
+  gitleaks:
+    name: Secrets (gitleaks)
+    if: inputs.gitleaks
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan the whole history
+        # A secret that was ever committed stays a finding until it is rotated and allowlisted with a
+        # reason in .gitleaks.toml.
+        env:
+          CONFIG: ${{ inputs.gitleaks-config }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CONFIG" ] && [ -f .gitleaks.toml ]; then CONFIG=.gitleaks.toml; fi
+          if [ -z "$CONFIG" ]; then
+            # Org default: the standard rules, plus the one false positive every app with a vendored
+            # kit copy shares. VENDORED.json lists SHA-256 hashes of the vendored files.
+            CONFIG="$RUNNER_TEMP/gitleaks.toml"
+            cat > "$CONFIG" <<'TOML'
+          [extend]
+          useDefault = true
+
+          [[allowlists]]
+          description = "VENDORED.json lists SHA-256 hashes of vendored kit files, not credentials"
+          condition = "AND"
+          paths = ['(^|/)VENDORED\.json$']
+          regexTarget = "secret"
+          regexes = ['^[0-9a-f]{64}$']
+          TOML
+          fi
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact=100 --config "$CONFIG" .
+
+  osv:
+    name: Dependencies (osv-scanner)
+    if: inputs.osv && github.event_name != 'push'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install osv-scanner
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+      - name: Scan lockfiles
+        # Reads every lockfile under the path. Ignores, with a reason and an expiry, go in
+        # osv-scanner.toml next to the lockfile. A repository with no lockfile passes.
+        env:
+          SCAN_PATH: ${{ inputs.path }}
+        # --no-resolve keeps the scan to versions written in the repository: resolving a version range
+        # in a requirements file picks a version that may never be installed.
+        run: '"$RUNNER_TEMP/osv-scanner" scan source --recursive --allow-no-lockfiles --no-resolve "$SCAN_PATH"'
+
+  semgrep:
+    name: Static analysis (Semgrep)
+    if: inputs.semgrep && github.event_name != 'push'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Scan
+        # Community rules from the public registry; no Semgrep account or token. Findings are
+        # suppressed in code with a `nosemgrep: <rule-id>` comment and a reason, or by path in
+        # .semgrepignore.
+        env:
+          SCAN_PATH: ${{ inputs.path }}
+          CONFIG: ${{ inputs.semgrep-config }}
+          SEVERITY: ${{ inputs.semgrep-severity }}
+          EXCLUDE_RULES: ${{ inputs.semgrep-exclude-rules }}
+        run: |
+          set -euo pipefail
+          excludes=()
+          while IFS= read -r rule; do
+            if [ -n "$rule" ]; then excludes+=(--exclude-rule "$rule"); fi
+          done <<< "$EXCLUDE_RULES"
+          case "$SEVERITY" in
+            INFO) levels=(--severity INFO --severity WARNING --severity ERROR) ;;
+            WARNING) levels=(--severity WARNING --severity ERROR) ;;
+            ERROR) levels=(--severity ERROR) ;;
+            *) echo "::error::semgrep-severity must be INFO, WARNING or ERROR, not '$SEVERITY'"; exit 1 ;;
+          esac
+          docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan --config "$CONFIG" --metrics=off --error "${levels[@]}" "${excludes[@]}" "$SCAN_PATH"
+
+  trivy-fs:
+    name: Filesystem (Trivy)
+    if: inputs.trivy-fs && github.event_name != 'push'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          archive="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${archive}"
+          echo "${TRIVY_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" trivy
+      - name: Scan vulnerabilities and misconfiguration
+        # Fails on fixable findings at the listed severities. Ignores, with a reason, go in
+        # .trivyignore at the repository root.
+        env:
+          SCAN_PATH: ${{ inputs.path }}
+          SEVERITY: ${{ inputs.severity }}
+        run: |
+          "$RUNNER_TEMP/trivy" fs --scanners vuln,misconfig --severity "$SEVERITY" --ignore-unfixed \
+            --exit-code 1 "$SCAN_PATH"
+
+  image:
+    name: Image and SBOM (Trivy)
+    needs: plan
+    if: inputs.image && needs.plan.outputs.dockerfile == 'true' && needs.plan.outputs.heavy == 'true'
+    # Heavy job: runs on the self-hosted Spark scan runner by default, so it uses no billed minutes. Actions has
+    # no automatic fallback when a self-hosted runner is offline (the job waits in the queue), so the fallback is
+    # a switch: LABS_SCAN_RUNNER or the heavy-runner input set to "ubuntu-latest".
+    runs-on: ${{ fromJSON(inputs.heavy-runner != '' && inputs.heavy-runner || (vars.LABS_SCAN_RUNNER != '' && vars.LABS_SCAN_RUNNER || '["self-hosted","spark","scan"]')) }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      # Unique per run: a self-hosted runner keeps images between jobs.
+      IMAGE: security-baseline-${{ github.run_id }}-${{ github.run_attempt }}:scan
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          # The Spark runner is ARM64; GitHub-hosted runners are x64.
+          case "$(uname -m)" in
+            x86_64) archive="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"; sum="$TRIVY_SHA256" ;;
+            aarch64|arm64) archive="trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"; sum="$TRIVY_ARM64_SHA256" ;;
+            *) echo "::error::no pinned Trivy build for $(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${archive}"
+          echo "${sum}  $RUNNER_TEMP/${archive}" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" trivy
+      - name: Build the image
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.docker-context }}
+          BUILD_ARGS: ${{ inputs.docker-build-args }}
+          # A self-hosted runner may start jobs without a usable TMPDIR; podman and bash both need one.
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          args=(build --pull -t "$IMAGE" -f "$DOCKERFILE")
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then args+=(--build-arg "$line"); fi
+          done < <(printf '%s\n' "$BUILD_ARGS")
+          docker "${args[@]}" "$CONTEXT"
+          # Trivy reads the saved archive, so it works whether the runner's docker is Docker or podman.
+          docker save -o "$RUNNER_TEMP/image.tar" "$IMAGE"
+      - name: Record the scanned platform
+        # The Spark runner builds linux/arm64 with no x86 emulation, so there the SBOM and the image scan
+        # describe the arm64 variant of the image, not the amd64 image that is deployed. The base packages
+        # are the same in practice; architecture-specific wheels or binaries can differ.
+        run: |
+          echo "Image built and scanned on $(uname -m) (runner arch $RUNNER_ARCH). The SBOM describes that platform." \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Write the SBOM
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: '"$RUNNER_TEMP/trivy" image --skip-version-check --format cyclonedx --output "$RUNNER_TEMP/sbom.cdx.json" --input "$RUNNER_TEMP/image.tar"'
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.sbom-artifact-name }}
+          path: ${{ runner.temp }}/sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Scan the image
+        # Runs after the SBOM upload, so a failing scan still leaves the SBOM behind.
+        env:
+          SEVERITY: ${{ inputs.severity }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/trivy" image --skip-version-check --scanners vuln --severity "$SEVERITY" --ignore-unfixed \
+            --exit-code 1 --input "$RUNNER_TEMP/image.tar"
+      - name: Remove the image
+        if: always()
+        run: |
+          docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
+          rm -f "$RUNNER_TEMP/image.tar"
