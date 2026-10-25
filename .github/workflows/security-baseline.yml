@@ -22,6 +22,10 @@ name: Security baseline
 # gitleaks/gitleaks-action is not used: it refuses to run on an organisation repository without a
 # paid licence. The only actions used are actions/checkout and actions/upload-artifact, pinned by
 # commit SHA. Pins verified against the upstream release checksums on 21 October 2026.
+#
+# On a self-hosted runner with a persistent, marked cache directory, the image job reuses the pinned
+# Trivy archive and the Trivy vulnerability DB between jobs. A cached archive is checked against the
+# same pinned SHA-256 before every run. See "Install Trivy" in the image job.
 
 on:
   workflow_call:
@@ -327,6 +331,28 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Trivy
+        # Runner cache (self-hosted only). The job reuses the pinned Trivy archive and the vulnerability DB
+        # from a persistent per-runner directory, so a slow github.com or mirror.gcr.io costs one download
+        # per runner, not one per job.
+        #
+        # - The cache is used only on a self-hosted runner whose cache root exists, is writable and holds a
+        #   `.persistent` marker. The root is $LABS_SCAN_CACHE when the runner sets it, else
+        #   ${RUNNER_TOOL_CACHE:-$HOME/.cache}/labs-scan. The marker is placed by whoever mounts the volume,
+        #   so an ephemeral runner (a container thrown away after each job) never writes a cache that dies
+        #   with it. Hosted runners, and self-hosted runners without the marker, behave exactly as before.
+        # - Binary: <root>/trivy/<version>/<archive>. A cached archive is copied into RUNNER_TEMP and the
+        #   copy is checked against the pinned SHA-256 before it is unpacked, as a download is; a copy that
+        #   does not match is discarded and the archive is downloaded. A verified download is saved to the
+        #   cache through a temp file and mv, so a reader never sees a half-written archive.
+        # - DB: <root>/trivy-cache, passed to every trivy call as TRIVY_CACHE_DIR. DB updates stay on:
+        #   Trivy downloads a new DB only when the cached one's NextUpdate time has passed. Each trivy call
+        #   holds an exclusive flock on <root>/trivy-cache.lock, so two jobs on one host cannot write the DB
+        #   at once. TRIVY_CACHE_BACKEND=memory keeps per-image layer results out of the persistent
+        #   directory, so it holds only the DBs and does not grow with every scanned image.
+        # - Trust: the DB is not signed by Trivy, so a job that can write the cache volume could alter it.
+        #   Only repositories in the runner group can run there; the binary stays verified on every run.
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           set -euo pipefail
           # The Spark runner is ARM64; GitHub-hosted runners are x64.
@@ -335,10 +361,54 @@ jobs:
             aarch64|arm64) archive="trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"; sum="$TRIVY_ARM64_SHA256" ;;
             *) echo "::error::no pinned Trivy build for $(uname -m)"; exit 1 ;;
           esac
-          curl -fsSL -o "$RUNNER_TEMP/$archive" \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${archive}"
-          echo "${sum}  $RUNNER_TEMP/${archive}" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" trivy
+
+          cache=""
+          if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            root="${LABS_SCAN_CACHE:-${RUNNER_TOOL_CACHE:-$HOME/.cache}/labs-scan}"
+            if [ -f "$root/.persistent" ] && [ -w "$root" ]; then cache="$root"; fi
+          fi
+
+          bin="$RUNNER_TEMP/$archive"
+          source=download
+          if [ -n "$cache" ]; then
+            cached="$cache/trivy/$TRIVY_VERSION/$archive"
+            if [ -f "$cached" ]; then
+              cp "$cached" "$bin"
+              if echo "${sum}  ${bin}" | sha256sum -c --status -; then
+                source=cache
+              else
+                echo "::warning::cached Trivy archive does not match the pinned SHA-256; downloading it again"
+                rm -f "$bin"
+              fi
+            fi
+          fi
+          if [ "$source" = download ]; then
+            curl -fsSL -o "$bin" \
+              "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${archive}"
+          fi
+          # Checks the file that is unpacked, whichever source it came from.
+          echo "${sum}  ${bin}" | sha256sum -c -
+          tar -xzf "$bin" -C "$RUNNER_TEMP" trivy
+
+          if [ -n "$cache" ]; then
+            if [ "$source" = download ]; then
+              mkdir -p "$(dirname "$cached")"
+              tmp="$(mktemp "$(dirname "$cached")/.${archive}.XXXXXX")"
+              cp "$bin" "$tmp"
+              mv -f "$tmp" "$cached"
+            fi
+            mkdir -p "$cache/trivy-cache"
+            {
+              echo "TRIVY_CACHE_DIR=$cache/trivy-cache"
+              echo "TRIVY_CACHE_BACKEND=memory"
+              echo "LABS_TRIVY_LOCK=$cache/trivy-cache.lock"
+            } >> "$GITHUB_ENV"
+            echo "Trivy ${TRIVY_VERSION}: binary from the ${source}; vulnerability DB cached in $cache/trivy-cache." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Trivy ${TRIVY_VERSION}: no runner cache; binary and vulnerability DB downloaded for this job." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Build the image
         env:
           DOCKERFILE: ${{ inputs.dockerfile }}
@@ -365,7 +435,13 @@ jobs:
       - name: Write the SBOM
         env:
           TMPDIR: ${{ runner.temp }}
-        run: '"$RUNNER_TEMP/trivy" image --skip-version-check --format cyclonedx --output "$RUNNER_TEMP/sbom.cdx.json" --input "$RUNNER_TEMP/image.tar"'
+        run: |
+          set -euo pipefail
+          # With the runner cache on, wait up to 10 minutes for another job's trivy call to finish.
+          lock=()
+          if [ -n "${LABS_TRIVY_LOCK:-}" ]; then lock=(flock --wait 600 "$LABS_TRIVY_LOCK"); fi
+          "${lock[@]}" "$RUNNER_TEMP/trivy" image --skip-version-check --format cyclonedx \
+            --output "$RUNNER_TEMP/sbom.cdx.json" --input "$RUNNER_TEMP/image.tar"
       - name: Upload the SBOM
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -379,8 +455,11 @@ jobs:
           SEVERITY: ${{ inputs.severity }}
           TMPDIR: ${{ runner.temp }}
         run: |
-          "$RUNNER_TEMP/trivy" image --skip-version-check --scanners vuln --severity "$SEVERITY" --ignore-unfixed \
-            --exit-code 1 --input "$RUNNER_TEMP/image.tar"
+          set -euo pipefail
+          lock=()
+          if [ -n "${LABS_TRIVY_LOCK:-}" ]; then lock=(flock --wait 600 "$LABS_TRIVY_LOCK"); fi
+          "${lock[@]}" "$RUNNER_TEMP/trivy" image --skip-version-check --scanners vuln --severity "$SEVERITY" \
+            --ignore-unfixed --exit-code 1 --input "$RUNNER_TEMP/image.tar"
       - name: Remove the image
         if: always()
         run: |
