@@ -19,3 +19,6 @@ concurrency:
 jobs:
   baseline:
     uses: alliwanlabs/.github/.github/workflows/security-baseline.yml@main
+    secrets:
+      # Lets the baseline check whether a Spark scan runner is online; without it the image scan runs on GitHub-hosted.
+      scan-status-app-key: ${{ secrets.LABS_SCAN_STATUS_APP_KEY }}

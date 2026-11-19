@@ -56,6 +56,25 @@ jobs:
       heavy-runner: '"ubuntu-latest"'
       sbom-artifact-name: sbom-fixture
 
+  fixture-auto:
+    # The automatic placement with no runner-status secret (this repository is public and gets none): the plan
+    # job must place the image scan on GitHub-hosted, and the scan must still run.
+    name: Baseline on the fixture, automatic runner placement
+    uses: ./.github/workflows/security-baseline.yml
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      path: tests/baseline-fixture
+      dockerfile: tests/baseline-fixture/Dockerfile
+      docker-context: tests/baseline-fixture
+      heavy: always
+      gitleaks: false
+      osv: false
+      semgrep: false
+      trivy-fs: false
+      sbom-artifact-name: sbom-fixture-auto
+
   defaults:
     name: Baseline with caller defaults
     uses: ./.github/workflows/security-baseline.yml
@@ -65,7 +84,7 @@ jobs:
 
   sbom:
     name: SBOM is CycloneDX
-    needs: fixture
+    needs: [fixture, fixture-auto]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -73,8 +92,13 @@ jobs:
         with:
           name: sbom-fixture
           path: sbom
-      - name: Check the document
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom-fixture-auto
+          path: sbom-auto
+      - name: Check the documents
         run: |
           set -euo pipefail
-          jq -e '.bomFormat == "CycloneDX" and (.specVersion | length > 0) and (.metadata.component.name | length > 0)' \
-            sbom/sbom.cdx.json
+          for f in sbom/sbom.cdx.json sbom-auto/sbom.cdx.json; do
+            jq -e '.bomFormat == "CycloneDX" and (.specVersion | length > 0) and (.metadata.component.name | length > 0)' "$f"
+          done

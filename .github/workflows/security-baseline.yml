@@ -8,15 +8,21 @@ name: Security baseline
 #   jobs:
 #     baseline:
 #       uses: alliwanlabs/.github/.github/workflows/security-baseline.yml@main
+#       secrets:
+#         scan-status-app-key: ${{ secrets.LABS_SCAN_STATUS_APP_KEY }}
 #
 # Light scans run on every pull request, on schedule and on manual runs (a push to the default branch
 # already passed them as a pull request; gitleaks still runs on every push): gitleaks (secrets, whole
 # history), osv-scanner (known vulnerabilities in lockfiles), Semgrep Community rules (p/default) and
 # a Trivy filesystem scan (vulnerabilities and misconfiguration). Heavy scans (image build, Trivy
-# image scan and a CycloneDX SBOM uploaded as an artifact, on the self-hosted Spark scan runner by
-# default) run only when the repository has a Dockerfile, and then only on a push to the default
-# branch, on schedule or manual runs, and on pull requests that change a Dockerfile, a manifest or a
-# lockfile.
+# image scan and a CycloneDX SBOM uploaded as an artifact) run only when the repository has a
+# Dockerfile, and then only on a push to the default branch, on schedule or manual runs, and on pull
+# requests that change a Dockerfile, a manifest or a lockfile.
+#
+# The image scan runs on the self-hosted Spark scan runner when one is online for the repository, and
+# on GitHub-hosted otherwise or when Spark stalls; it is never skipped. The scan-status-app-key secret
+# lets the plan job check the Spark runners; without it the scan runs on GitHub-hosted. Procedure and
+# overrides: docs/scan-runner.md in alliwanlabs/.github.
 #
 # Every scanner is a released binary or image pinned by version and SHA-256, checked before it runs.
 # gitleaks/gitleaks-action is not used: it refuses to run on an organisation repository without a
@@ -96,15 +102,33 @@ on:
         default: ubuntu-latest
       heavy-runner:
         description: >-
-          Runner for the image job, as JSON: a label string or a list of labels. Empty uses the organisation or
-          repository variable LABS_SCAN_RUNNER when set, else the Spark scan runner ["self-hosted","spark","scan"].
-          Set it (or LABS_SCAN_RUNNER) to "ubuntu-latest" to fall back to GitHub-hosted.
+          Where the image scan runs. Empty uses the organisation or repository variable LABS_SCAN_RUNNER, and when
+          that is empty too, auto. auto: Spark when a Spark scan runner is online for this repository, else
+          GitHub-hosted. spark: Spark without the runner check (a stall still falls back to GitHub-hosted).
+          hosted, or a runner label as plain text or JSON (a string or a list): that runner, never Spark.
+        type: string
+        default: ""
+      spark-build-minutes:
+        description: Minutes the image build may take on Spark before the scan moves to GitHub-hosted (1 to 30; outside values are clamped).
+        type: number
+        default: 15
+      spark-test-stall:
+        description: >-
+          Test only. "checkout" makes the Spark job stall for 10 minutes in place of its checkout, to prove the hand-over
+          to GitHub-hosted. Leave empty.
         type: string
         default: ""
       sbom-artifact-name:
         description: Name of the uploaded SBOM artifact.
         type: string
         default: sbom
+    secrets:
+      scan-status-app-key:
+        description: >-
+          Private key of the runner-status GitHub App (organisation secret LABS_SCAN_STATUS_APP_KEY; its App ID is the
+          variable LABS_SCAN_STATUS_APP_ID). Lets the plan job check whether a Spark runner is online. Without it,
+          auto places the image scan on GitHub-hosted.
+        required: false
 
 env:
   GITLEAKS_VERSION: 8.30.1
@@ -129,6 +153,10 @@ jobs:
     outputs:
       heavy: ${{ steps.plan.outputs.heavy }}
       dockerfile: ${{ steps.plan.outputs.dockerfile }}
+      placement: ${{ steps.runner.outputs.placement }}
+      placement-reason: ${{ steps.runner.outputs.placement-reason }}
+      spark-runner: ${{ steps.runner.outputs.spark-runner }}
+      hosted-runner: ${{ steps.runner.outputs.hosted-runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -174,6 +202,156 @@ jobs:
           echo "heavy=$heavy" >> "$GITHUB_OUTPUT"
           echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
           echo "Event $EVENT on $REF. Dockerfile present: $dockerfile. Heavy scans: $heavy." >> "$GITHUB_STEP_SUMMARY"
+      - name: Choose the scan runner
+        # Decides where the image scan runs, before any job waits for a runner: a job queued for a self-hosted
+        # label that no runner takes waits for hours and cannot time out, so this check comes first.
+        #
+        # - heavy-runner input, else LABS_SCAN_RUNNER (case-insensitive): empty or "auto" checks the Spark runners
+        #   (below); "spark" uses Spark without the check (the step timeouts still hand a stall to GitHub-hosted, but
+        #   a job queued with no runner free is not covered); anything else ("hosted", "ubuntu-latest", a JSON label
+        #   or list) skips Spark and scans on that runner, "hosted" meaning ubuntu-latest.
+        # - Never Spark for pull_request_target or a pull request from a fork: that code does not run on a
+        #   self-hosted runner, whatever the override says.
+        # - auto: with the runner-status App (variable LABS_SCAN_STATUS_APP_ID and the scan-status-app-key secret;
+        #   the App holds only Self-hosted runners: Read), it picks Spark when a runner with every Spark label is
+        #   online and idle in a runner group that serves this repository. Missing credentials, an API error, or no
+        #   such runner after three looks 20 seconds apart: GitHub-hosted. Every doubt falls toward the
+        #   GitHub-hosted scan, never toward skipping it.
+        id: runner
+        if: steps.plan.outputs.heavy == 'true' && steps.plan.outputs.dockerfile == 'true'
+        env:
+          OVERRIDE: ${{ inputs.heavy-runner != '' && inputs.heavy-runner || vars.LABS_SCAN_RUNNER }}
+          SPARK_LABELS: '["self-hosted","spark","scan"]'
+          APP_ID: ${{ vars.LABS_SCAN_STATUS_APP_ID }}
+          APP_KEY: ${{ secrets.scan-status-app-key }}
+          ORG: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          API: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+          spark_runner="$SPARK_LABELS"
+          hosted_runner='"ubuntu-latest"'
+          mode=auto
+          compact="$(printf '%s' "$OVERRIDE" | tr -d ' \n')"
+          lower="$(printf '%s' "$compact" | tr '[:upper:]' '[:lower:]')"
+          case "$lower" in
+            ''|auto|'"auto"') mode=auto ;;
+            spark|'"spark"'|"$SPARK_LABELS") mode=spark ;;
+            hosted|'"hosted"') mode=hosted ;;
+            '['*|'"'*) mode=hosted; hosted_runner="$compact" ;;
+            *) mode=hosted; hosted_runner="\"$compact\"" ;;
+          esac
+
+          untrusted=""
+          if [ "$EVENT" = pull_request_target ]; then
+            untrusted="a pull_request_target event"
+          elif [ "$EVENT" = pull_request ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$REPO" ]; then
+            untrusted="a pull request from the fork $HEAD_REPO"
+          fi
+
+          placement=hosted
+          reason=""
+          if [ -n "$untrusted" ] && [ "$mode" != hosted ]; then
+            reason="$untrusted never runs on a self-hosted runner"
+            mode=none
+          fi
+          case "$mode" in
+            none) ;;
+            spark) placement=spark; reason="LABS_SCAN_RUNNER or heavy-runner is spark (no runner check)" ;;
+            hosted) reason="LABS_SCAN_RUNNER or heavy-runner chose $hosted_runner" ;;
+            auto)
+              if [ -z "$APP_ID" ] || [ -z "$APP_KEY" ]; then
+                reason="no runner-status credentials (LABS_SCAN_STATUS_APP_ID and the scan-status-app-key secret), so Spark cannot be checked"
+              else
+                # A token from the runner-status App, which can only read self-hosted runners.
+                b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+                token=""
+                key="$(mktemp)"
+                printf '%s\n' "$APP_KEY" > "$key"
+                now="$(date +%s)"
+                jwt_head="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+                jwt_body="$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now - 60))" "$((now + 300))" "$APP_ID" | b64url)"
+                if sig="$(printf '%s.%s' "$jwt_head" "$jwt_body" | openssl dgst -sha256 -sign "$key" -binary | b64url)"; then
+                  jwt="$jwt_head.$jwt_body.$sig"
+                  inst="$(curl -fsS --max-time 20 -H "Authorization: Bearer $jwt" -H 'Accept: application/vnd.github+json' \
+                    "$API/orgs/$ORG/installation" | jq -r '.id // empty' || true)"
+                  if [ -n "$inst" ]; then
+                    token="$(curl -fsS --max-time 20 -X POST -H "Authorization: Bearer $jwt" \
+                      -H 'Accept: application/vnd.github+json' "$API/app/installations/$inst/access_tokens" \
+                      -d '{"permissions":{"organization_self_hosted_runners":"read"}}' | jq -r '.token // empty' || true)"
+                  fi
+                fi
+                rm -f "$key"
+                if [ -z "$token" ]; then
+                  reason="the runner-status token could not be created, so Spark cannot be checked"
+                else
+                  echo "::add-mask::$token"
+                  # Prints "<online> <idle>": Spark runners online, and online and idle, in the runner groups that
+                  # serve this repository. Fails when any API call fails. Every output is captured before it is
+                  # filtered, so no early-closing reader can fail a pipeline.
+                  usable() {
+                    local groups gid vis public runners repos allowed on idle
+                    groups="$(GH_TOKEN="$token" gh api --paginate "orgs/$ORG/actions/runner-groups?per_page=100" \
+                      --jq '.runner_groups[] | "\(.id) \(.visibility) \(.allows_public_repositories)"')" || return 1
+                    on=0
+                    idle=0
+                    while read -r gid vis public; do
+                      [ -n "$gid" ] || continue
+                      runners="$(GH_TOKEN="$token" gh api --paginate "orgs/$ORG/actions/runner-groups/$gid/runners?per_page=100" \
+                        --jq ".runners[] | select(.status == \"online\") | select([.labels[].name] as \$have | $SPARK_LABELS | all(. as \$l | \$have | any(. == \$l))) | \"\(.name) \(.busy)\"")" || return 1
+                      [ -n "$runners" ] || continue
+                      # A public repository is served only by a group that allows public repositories; "private"
+                      # visibility means the organisation's private repositories only.
+                      if [ "$REPO_PRIVATE" != true ] && [ "$public" != true ]; then continue; fi
+                      case "$vis" in
+                        all) allowed=yes ;;
+                        private) if [ "$REPO_PRIVATE" = true ]; then allowed=yes; else allowed=no; fi ;;
+                        selected)
+                          repos="$(GH_TOKEN="$token" gh api --paginate "orgs/$ORG/actions/runner-groups/$gid/repositories?per_page=100" \
+                            --jq '.repositories[].full_name')" || return 1
+                          if printf '%s\n' "$repos" | grep -Fxq "$REPO"; then allowed=yes; else allowed=no; fi
+                          ;;
+                        *) allowed=no ;;
+                      esac
+                      [ "$allowed" = yes ] || continue
+                      on=$((on + $(printf '%s\n' "$runners" | grep -c .)))
+                      idle=$((idle + $(printf '%s\n' "$runners" | grep -c ' false$' || true)))
+                    done <<< "$groups"
+                    echo "$on $idle"
+                  }
+                  counts=""
+                  for look in 1 2 3; do
+                    if ! counts="$(usable)"; then counts=error; break; fi
+                    if [ "${counts#* }" -gt 0 ]; then break; fi
+                    if [ "$look" -lt 3 ]; then sleep 20; fi
+                  done
+                  if [ "$counts" = error ]; then
+                    reason="the runner-status API failed, so Spark cannot be checked"
+                  elif [ "${counts#* }" -gt 0 ]; then
+                    placement=spark
+                    reason="${counts#* } of ${counts% *} online Spark runner(s) idle for this repository"
+                  elif [ "${counts% *}" -gt 0 ]; then
+                    reason="every Spark runner that serves this repository is busy"
+                    echo "::notice title=Scan runner busy::Every Spark scan runner that serves $REPO is busy; the image is scanned on GitHub-hosted."
+                  else
+                    reason="no Spark runner is online in a runner group that serves this repository"
+                    echo "::warning title=Scan runner offline::No Spark scan runner is online in a runner group that serves $REPO; the image is scanned on GitHub-hosted."
+                  fi
+                fi
+              fi
+              ;;
+          esac
+
+          {
+            echo "placement=$placement"
+            echo "placement-reason=$reason"
+            echo "spark-runner=$spark_runner"
+            echo "hosted-runner=$hosted_runner"
+          } >> "$GITHUB_OUTPUT"
+          echo "Image scan placement: $placement ($reason)." >> "$GITHUB_STEP_SUMMARY"
 
   gitleaks:
     name: Secrets (gitleaks)
@@ -312,25 +490,58 @@ jobs:
           "$RUNNER_TEMP/trivy" fs --scanners vuln,misconfig --severity "$SEVERITY" --ignore-unfixed \
             --exit-code 1 "$SCAN_PATH"
 
-  image:
-    name: Image and SBOM (Trivy)
+  # The image scan runs in up to two jobs, so that a stalled or missing Spark scan runner never blocks a release
+  # and never skips the scan:
+  #
+  # 1. "Image and SBOM (Trivy) on Spark" runs only when the plan job placed the scan on Spark (an online Spark
+  #    runner this repository may use, or LABS_SCAN_RUNNER=spark). Every step that can stall on the runner
+  #    (checkout, Trivy install, build, SBOM, scan) has a short timeout. A stall or an infrastructure failure
+  #    ends the job green with scanned=false and a "scan runner stalled" warning, so the head commit carries no
+  #    red or cancelled check run for it. Only a real finding (Trivy exit code 13) fails this job.
+  # 2. "Image and SBOM (Trivy)" always runs when the image is due, on a GitHub-hosted runner (or the override).
+  #    It is the verdict: when Spark scanned, it records that and finishes in seconds; when Spark found
+  #    HIGH/CRITICAL vulnerabilities, it fails; otherwise (Spark not used, stalled or failed) it builds and
+  #    scans the image itself. Its name is the one the check had before, so consumers keep reading it.
+  image-spark:
+    name: Image and SBOM (Trivy) on Spark
     needs: plan
-    if: inputs.image && needs.plan.outputs.dockerfile == 'true' && needs.plan.outputs.heavy == 'true'
-    # Heavy job: runs on the self-hosted Spark scan runner by default, so it uses no billed minutes. Actions has
-    # no automatic fallback when a self-hosted runner is offline (the job waits in the queue), so the fallback is
-    # a switch: LABS_SCAN_RUNNER or the heavy-runner input set to "ubuntu-latest".
-    runs-on: ${{ fromJSON(inputs.heavy-runner != '' && inputs.heavy-runner || (vars.LABS_SCAN_RUNNER != '' && vars.LABS_SCAN_RUNNER || '["self-hosted","spark","scan"]')) }}
-    timeout-minutes: 25
+    if: inputs.image && needs.plan.outputs.dockerfile == 'true' && needs.plan.outputs.heavy == 'true' && needs.plan.outputs.placement == 'spark'
+    runs-on: ${{ fromJSON(needs.plan.outputs.spark-runner) }}
+    # A stall ends at its step's own timeout and every later step is skipped, so a stalled job lasts at most the
+    # steps before it plus that timeout: about 25 minutes with the default build limit. The job timeout is the last
+    # resort for what no step timeout covers (a hang in "Set up job" or a dead runner agent), and those end red or
+    # cancelled: see docs/scan-runner.md. 45 minutes, or 60 when the build may take more than 15.
+    timeout-minutes: ${{ inputs.spark-build-minutes > 15 && 60 || 45 }}
     permissions:
       contents: read
+    outputs:
+      scanned: ${{ steps.result.outputs.scanned }}
+      findings: ${{ steps.result.outputs.findings }}
+      stalled-at: ${{ steps.result.outputs.stalled-at }}
     env:
       # Unique per run: a self-hosted runner keeps images between jobs.
       IMAGE: security-baseline-${{ github.run_id }}-${{ github.run_attempt }}:scan
     steps:
+      - name: Stall test
+        # Test only (input spark-test-stall: checkout): stands in for a checkout that hangs, under the same 5-minute
+        # timeout, so the hand-over can be proved on the real runner.
+        id: stall
+        if: inputs.spark-test-stall == 'checkout'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: sleep 600
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        if: steps.stall.outcome != 'failure'
+        continue-on-error: true
+        timeout-minutes: 5
         with:
           persist-credentials: false
       - name: Install Trivy
+        id: install
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
         # Runner cache (self-hosted only). The job reuses the pinned Trivy archive and the vulnerability DB
         # from a persistent per-runner directory, so a slow github.com or mirror.gcr.io costs one download
         # per runner, not one per job.
@@ -410,6 +621,10 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Build the image
+        id: build
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: ${{ inputs.spark-build-minutes > 30 && 30 || (inputs.spark-build-minutes < 1 && 1 || inputs.spark-build-minutes) }}
         env:
           DOCKERFILE: ${{ inputs.dockerfile }}
           CONTEXT: ${{ inputs.docker-context }}
@@ -426,6 +641,7 @@ jobs:
           # Trivy reads the saved archive, so it works whether the runner's docker is Docker or podman.
           docker save -o "$RUNNER_TEMP/image.tar" "$IMAGE"
       - name: Record the scanned platform
+        if: steps.build.outcome == 'success'
         # The Spark runner builds linux/arm64 with no x86 emulation, so there the SBOM and the image scan
         # describe the arm64 variant of the image, not the amd64 image that is deployed. The base packages
         # are the same in practice; architecture-specific wheels or binaries can differ.
@@ -433,6 +649,10 @@ jobs:
           echo "Image built and scanned on $(uname -m) (runner arch $RUNNER_ARCH). The SBOM describes that platform." \
             >> "$GITHUB_STEP_SUMMARY"
       - name: Write the SBOM
+        id: sbom
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 12
         env:
           TMPDIR: ${{ runner.temp }}
         run: |
@@ -443,6 +663,10 @@ jobs:
           "${lock[@]}" "$RUNNER_TEMP/trivy" image --skip-version-check --format cyclonedx \
             --output "$RUNNER_TEMP/sbom.cdx.json" --input "$RUNNER_TEMP/image.tar"
       - name: Upload the SBOM
+        id: upload
+        if: steps.sbom.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ inputs.sbom-artifact-name }}
@@ -450,18 +674,195 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Scan the image
-        # Runs after the SBOM upload, so a failing scan still leaves the SBOM behind.
+        id: scan
+        if: steps.upload.outcome == 'success'
+        # Runs after the SBOM upload, so a failing scan still leaves the SBOM behind. Trivy exits 13 on findings and 1
+        # on its own errors, so the two are told apart. This step records the result in its outputs and does not
+        # fail on it; "Fail on findings" below fails the job. Anything that is not a clean pass or a finding
+        # (including the 12-minute stall timeout, exit 124) hands the scan to the GitHub-hosted job.
+        continue-on-error: true
+        timeout-minutes: 15
         env:
           SEVERITY: ${{ inputs.severity }}
           TMPDIR: ${{ runner.temp }}
         run: |
-          set -euo pipefail
+          # The runner's default shell is bash -e: switch errexit off, or Trivy's exit code ends the script before
+          # it is read.
+          set +e
+          set -uo pipefail
           lock=()
           if [ -n "${LABS_TRIVY_LOCK:-}" ]; then lock=(flock --wait 600 "$LABS_TRIVY_LOCK"); fi
-          "${lock[@]}" "$RUNNER_TEMP/trivy" image --skip-version-check --scanners vuln --severity "$SEVERITY" \
-            --ignore-unfixed --exit-code 1 --input "$RUNNER_TEMP/image.tar"
+          timeout 720 "${lock[@]}" "$RUNNER_TEMP/trivy" image --skip-version-check --scanners vuln \
+            --severity "$SEVERITY" --ignore-unfixed --exit-code 13 --input "$RUNNER_TEMP/image.tar"
+          rc=$?
+          case "$rc" in
+            0) echo "findings=false" >> "$GITHUB_OUTPUT"; echo "verdict=pass" >> "$GITHUB_OUTPUT" ;;
+            13) echo "findings=true" >> "$GITHUB_OUTPUT"; echo "verdict=fail" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "verdict=none" >> "$GITHUB_OUTPUT"
+              echo "::warning::Trivy did not finish on this runner (exit $rc; 124 is the 12-minute timeout)."
+              ;;
+          esac
+      - name: Fail on findings
+        if: steps.scan.outputs.findings == 'true'
+        env:
+          SEVERITY: ${{ inputs.severity }}
+        run: |
+          echo "::error::Trivy found fixable $SEVERITY vulnerabilities in the image (listed in the step above)."
+          exit 1
+      - name: Hand over or keep the result
+        id: result
+        if: always()
+        env:
+          CHECKOUT: ${{ steps.checkout.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          SBOM: ${{ steps.sbom.outcome }}
+          UPLOAD: ${{ steps.upload.outcome }}
+          STALL: ${{ steps.stall.outcome }}
+          SCAN: ${{ steps.scan.outcome }}
+          VERDICT: ${{ steps.scan.outputs.verdict }}
+          FINDINGS: ${{ steps.scan.outputs.findings }}
+          RUNNER: ${{ runner.name }}
+        run: |
+          set -euo pipefail
+          # findings is read from the scan step's own output, never from a step outcome.
+          if [ "$FINDINGS" = true ]; then
+            # The job fails at "Fail on findings", and the verdict job fails too.
+            echo "scanned=true" >> "$GITHUB_OUTPUT"
+            echo "findings=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$FINDINGS" = false ] && [ "$VERDICT" = pass ]; then
+            echo "scanned=true" >> "$GITHUB_OUTPUT"
+            echo "findings=false" >> "$GITHUB_OUTPUT"
+            echo "Image scanned on the Spark runner $RUNNER. No GitHub-hosted scan is needed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          at=scan
+          if [ "$STALL" = failure ]; then CHECKOUT=failure; fi
+          for pair in "checkout:$CHECKOUT" "Trivy install:$INSTALL" "build:$BUILD" "SBOM:$SBOM" "SBOM upload:$UPLOAD"; do
+            if [ "${pair##*:}" != success ]; then at="${pair%:*}"; break; fi
+          done
+          echo "scanned=false" >> "$GITHUB_OUTPUT"
+          echo "stalled-at=$at" >> "$GITHUB_OUTPUT"
+          msg="Scan runner stalled or failed at the $at step on $RUNNER. This is the runner, not the code: the image is scanned on GitHub-hosted instead, in the job \"Image and SBOM (Trivy)\"."
+          echo "::warning title=Scan runner stalled::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
       - name: Remove the image
         if: always()
+        run: |
+          docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
+          rm -f "$RUNNER_TEMP/image.tar"
+
+  image:
+    name: Image and SBOM (Trivy)
+    needs: [plan, image-spark]
+    # always() so it runs after a skipped or failed Spark job; !cancelled() so a cancelled run stays cancelled.
+    if: >-
+      always() && !cancelled() && inputs.image && needs.plan.result == 'success'
+      && needs.plan.outputs.dockerfile == 'true' && needs.plan.outputs.heavy == 'true'
+    runs-on: ${{ fromJSON(needs.plan.outputs.hosted-runner) }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      IMAGE: security-baseline-${{ github.run_id }}-${{ github.run_attempt }}-hosted:scan
+    steps:
+      - name: Decide whether this job scans
+        id: decide
+        env:
+          PLACEMENT: ${{ needs.plan.outputs.placement }}
+          REASON: ${{ needs.plan.outputs.placement-reason }}
+          SPARK_RESULT: ${{ needs.image-spark.result }}
+          SPARK_SCANNED: ${{ needs.image-spark.outputs.scanned }}
+          SPARK_FINDINGS: ${{ needs.image-spark.outputs.findings }}
+          STALLED_AT: ${{ needs.image-spark.outputs.stalled-at }}
+        run: |
+          set -euo pipefail
+          if [ "$SPARK_FINDINGS" = true ]; then
+            echo "::error::The image scan on Spark found fixable vulnerabilities; see the job \"Image and SBOM (Trivy) on Spark\"."
+            exit 1
+          fi
+          if [ "$SPARK_RESULT" = success ] && [ "$SPARK_SCANNED" = true ]; then
+            echo "scan=false" >> "$GITHUB_OUTPUT"
+            echo "The image was scanned on Spark and passed. This job only records the verdict." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "scan=true" >> "$GITHUB_OUTPUT"
+          if [ "$PLACEMENT" = spark ]; then
+            why="the Spark job ended with ${SPARK_RESULT:-no result}${STALLED_AT:+ (stalled at the $STALLED_AT step)}"
+            echo "::warning title=Scan runner stalled::Spark did not scan the image: $why. Scanning on this runner instead."
+          else
+            why="$REASON"
+          fi
+          echo "Scanning on $RUNNER_NAME ($RUNNER_ENVIRONMENT): $why." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.decide.outputs.scan == 'true'
+        timeout-minutes: 10
+        with:
+          persist-credentials: false
+      - name: Install Trivy
+        if: steps.decide.outputs.scan == 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) archive="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"; sum="$TRIVY_SHA256" ;;
+            aarch64|arm64) archive="trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"; sum="$TRIVY_ARM64_SHA256" ;;
+            *) echo "::error::no pinned Trivy build for $(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${archive}"
+          echo "${sum}  $RUNNER_TEMP/${archive}" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" trivy
+      - name: Build the image
+        if: steps.decide.outputs.scan == 'true'
+        timeout-minutes: 20
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.docker-context }}
+          BUILD_ARGS: ${{ inputs.docker-build-args }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          args=(build --pull -t "$IMAGE" -f "$DOCKERFILE")
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then args+=(--build-arg "$line"); fi
+          done < <(printf '%s\n' "$BUILD_ARGS")
+          docker "${args[@]}" "$CONTEXT"
+          docker save -o "$RUNNER_TEMP/image.tar" "$IMAGE"
+          echo "Image built and scanned on $(uname -m) (runner arch $RUNNER_ARCH). The SBOM describes that platform." \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Write the SBOM
+        if: steps.decide.outputs.scan == 'true'
+        timeout-minutes: 10
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/trivy" image --skip-version-check --format cyclonedx \
+            --output "$RUNNER_TEMP/sbom.cdx.json" --input "$RUNNER_TEMP/image.tar"
+      - name: Upload the SBOM
+        if: steps.decide.outputs.scan == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.sbom-artifact-name }}
+          path: ${{ runner.temp }}/sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+          # The Spark job may have uploaded an SBOM before it stalled at the scan step; this one replaces it.
+          overwrite: true
+      - name: Scan the image
+        if: steps.decide.outputs.scan == 'true'
+        timeout-minutes: 15
+        env:
+          SEVERITY: ${{ inputs.severity }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/trivy" image --skip-version-check --scanners vuln --severity "$SEVERITY" \
+            --ignore-unfixed --exit-code 1 --input "$RUNNER_TEMP/image.tar"
+      - name: Remove the image
+        if: always() && steps.decide.outputs.scan == 'true'
         run: |
           docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
           rm -f "$RUNNER_TEMP/image.tar"
