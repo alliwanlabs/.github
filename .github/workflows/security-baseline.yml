@@ -686,6 +686,9 @@ jobs:
           SEVERITY: ${{ inputs.severity }}
           TMPDIR: ${{ runner.temp }}
         run: |
+          # The runner's default shell is bash -e: switch errexit off, or Trivy's exit code ends the script before
+          # it is read.
+          set +e
           set -uo pipefail
           lock=()
           if [ -n "${LABS_TRIVY_LOCK:-}" ]; then lock=(flock --wait 600 "$LABS_TRIVY_LOCK"); fi
