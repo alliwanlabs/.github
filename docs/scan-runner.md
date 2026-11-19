@@ -16,15 +16,19 @@ check run blocked the travelai-azure promotion of Rihla 9.27.
    waits for hours and cannot time out, so this check has to come first.
    - With the runner-status App (variable `LABS_SCAN_STATUS_APP_ID`, secret passed as `scan-status-app-key`) it
      mints a token that can only read self-hosted runners and runner groups. It places the scan on Spark when a
-     runner carrying `self-hosted`, `spark` and `scan` is online in a runner group the repository may use. It
-     looks three times, 20 seconds apart, because the ephemeral runners re-register between jobs.
-   - Missing credentials, a failed API call or no such runner: GitHub-hosted. Every doubt falls toward the
-     GitHub-hosted scan, never toward skipping it.
+     runner carrying `self-hosted`, `spark` and `scan` is online **and idle** in a runner group that serves the
+     repository (a group with `private` visibility, or one that does not allow public repositories, never serves
+     a public repository). It looks three times, 20 seconds apart, because the ephemeral runners re-register
+     between jobs.
+   - Missing credentials, a failed API call, or every Spark runner offline or busy: GitHub-hosted. Every doubt
+     falls toward the GitHub-hosted scan, never toward skipping it.
+   - A `pull_request_target` event or a pull request from a fork never runs on Spark, whatever the override says.
 2. **"Image and SBOM (Trivy) on Spark"** runs only when the plan chose Spark. Each step that can stall on the
-   runner has its own timeout: checkout 5 minutes, Trivy install 5, build `spark-build-minutes` (default 15),
-   SBOM 12, SBOM upload 5, scan 12. A stall or an infrastructure error ends the job **green**, with the warning
-   "Scan runner stalled or failed at the <step> step on <runner>. This is the runner, not the code". Only a real
-   finding (Trivy exit code 13) fails this job.
+   runner has its own timeout: checkout 5 minutes, Trivy install 5, build `spark-build-minutes` (default 15,
+   clamped to 1 to 30), SBOM 12, SBOM upload 5, scan 12. A stall or an infrastructure error ends the job
+   **green**, with the warning "Scan runner stalled or failed at the <step> step on <runner>. This is the
+   runner, not the code". Only a real finding fails this job: the scan step records Trivy's exit code 13 as
+   `findings=true` and the step "Fail on findings" fails the job on that output.
 3. **"Image and SBOM (Trivy)"** (the name the check has always had) runs on GitHub-hosted whenever the image is
    due. When Spark scanned and passed, it records that and ends in a few seconds. When Spark found
    vulnerabilities, it fails. Otherwise (Spark not chosen, stalled or failed) it builds, writes the SBOM and scans
@@ -34,12 +38,24 @@ On a run where Spark stalled, the commit therefore carries a green Spark check w
 "Image and SBOM (Trivy)" that holds the real verdict. There is no cancelled or failed check run for the stall, so
 travelai-azure's merge guard and promote gate see only the scan result.
 
-What the fallback does not cover:
+What the fallback does not cover, and what to do:
 
-- A runner the API reports online that never picks the job up. The job then waits in the queue. The monitor below
-  opens an issue after 15 minutes; cancel the run and re-run it with `LABS_SCAN_RUNNER=hosted` (below).
-- A runner that dies mid-job ("lost communication with the server"), or a stall in "Set up job" before the first
-  step. Both end in a red or cancelled Spark check. Re-run the failed jobs; the plan job places the re-run again.
+- **A runner the API reports online and idle that never picks the job up.** The job waits in the queue, and a
+  queued job cannot time out (GitHub fails it after 24 hours). The monitor below opens an issue after 15 minutes.
+  Do not cancel the run: a cancelled check run on the head commit blocks travelai-azure's merge guard. Instead:
+  1. Restart the stuck runner on the Spark host (systemd user units `ghscan-runner` and `ghscan-runner-2`, user
+     `ghscan`). The queued job starts and runs under the step timeouts above, handing over to GitHub-hosted if
+     Spark stalls again.
+  2. If Spark cannot come back soon, an organisation owner sets `LABS_SCAN_RUNNER=hosted` for the repository
+     (below), and the pull request gets a new commit: the new head runs the scan on GitHub-hosted, and the merge
+     guard reads the checks of the head that is merged.
+- **A runner that dies mid-job ("lost communication with the server"), or a hang in "Set up job" before the first
+  step.** No step timeout covers these. The job ends red, or cancelled at the job timeout (45 minutes, 60 when
+  `spark-build-minutes` is above 15; it was 25 before the fallback). Open the run and use **Re-run all jobs**:
+  the plan job places the new attempt again (on GitHub-hosted if Spark is still unavailable), and every check
+  run of the new attempt replaces the one of the same name.
+- The test-only input `spark-test-stall: checkout` makes the Spark job stall in place of its checkout; it exists
+  to prove the hand-over on the real runner. Callers leave it empty.
 
 ## Overrides: `LABS_SCAN_RUNNER` and `heavy-runner`
 
@@ -64,14 +80,18 @@ gh variable set LABS_SCAN_RUNNER -R alliwanlabs/<repo> --body hosted            
 gh variable delete LABS_SCAN_RUNNER --org alliwanlabs                                    # back to auto
 ```
 
-## The runner-status App (one-time set-up, organisation owner)
+## The two read-only Apps (one-time set-up, organisation owner)
 
-A dedicated GitHub App, not `alliwanlabs-agents`: its private key sits in an Actions secret that every private
-repository can read, so the App must hold nothing but read access to runners and Actions.
+Two dedicated GitHub Apps, neither of them `alliwanlabs-agents`. Whoever holds an App's private key can mint a
+token with every permission the App has, so each key must belong to an App that can do nothing more than its one
+job. The token a workflow asks for is narrower still, but that narrowing does not limit the key.
 
-1. Create the App under the organisation: name `alliwanlabs-scan-status`, no webhook, permissions
-   **Organization: Self-hosted runners: Read** and **Repository: Actions: Read** (the monitor reads queued jobs),
-   nothing else. Install it on the organisation, all repositories.
+**`alliwanlabs-scan-status`, used by the security baseline.** Its key is an organisation secret that every
+private repository's workflows can read, so it holds a single read permission.
+
+1. Create the App under the organisation: name `alliwanlabs-scan-status`, no webhook, permission
+   **Organization: Self-hosted runners: Read**, nothing else (no repository permissions). Install it on the
+   organisation.
 2. Organisation variable `LABS_SCAN_STATUS_APP_ID` = the App ID, visibility private repositories.
 3. Organisation secret `LABS_SCAN_STATUS_APP_KEY` = the App's private key (PEM), visibility private repositories.
 4. Callers pass the secret (the caller template already does):
@@ -86,13 +106,24 @@ repository can read, so the App must hold nothing but read access to runners and
 
 Until all four are in place, `auto` scans every image on GitHub-hosted.
 
+**`alliwanlabs-scan-monitor`, used only by the monitor.** It also reads queued jobs, so it needs Actions: Read on
+the repositories; its key lives only in azure-baseline.
+
+1. Create the App: name `alliwanlabs-scan-monitor`, no webhook, permissions **Organization: Self-hosted
+   runners: Read** and **Repository: Actions: Read**, nothing else. Install it on the organisation, all
+   repositories.
+2. Repository variable `LABS_SCAN_MONITOR_APP_ID` = its App ID, in alliwanlabs/azure-baseline only.
+3. Repository secret `LABS_SCAN_MONITOR_APP_KEY` = its private key, in alliwanlabs/azure-baseline only. Never an
+   organisation secret.
+
 ## The monitor
 
 `alliwanlabs/azure-baseline`, `.github/workflows/scan-runner-monitor.yml`, every 30 minutes on GitHub-hosted. It
 keeps one issue labelled `scan-runner-alert` in azure-baseline open while a Spark runner is offline, fewer than
 `LABS_SCAN_RUNNERS_EXPECTED` (default 2) are online, or a Spark image job has been queued for more than
-15 minutes. It comments when the findings change and closes the issue when everything is healthy. It is skipped
-until `LABS_SCAN_STATUS_APP_ID` exists.
+15 minutes in any repository a Spark runner group serves. It comments when the findings change and closes the
+issue when everything is healthy. An API error fails the run (red in azure-baseline's Actions tab) and never
+reads as healthy. It is skipped until `LABS_SCAN_MONITOR_APP_ID` exists.
 
 ## Cost
 
