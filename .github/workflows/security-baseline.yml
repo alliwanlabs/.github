@@ -210,8 +210,9 @@ jobs:
         #   (below); "spark" uses Spark without the check (the step timeouts still hand a stall to GitHub-hosted, but
         #   a job queued with no runner free is not covered); anything else ("hosted", "ubuntu-latest", a JSON label
         #   or list) skips Spark and scans on that runner, "hosted" meaning ubuntu-latest.
-        # - Never Spark for pull_request_target or a pull request from a fork: that code does not run on a
-        #   self-hosted runner, whatever the override says.
+        # - pull_request_target, and a pull request whose head is a fork or a deleted fork (no head repository):
+        #   always ubuntu-latest, whatever the override says, Spark or any other self-hosted label. That code never
+        #   runs on a self-hosted runner.
         # - auto: with the runner-status App (variable LABS_SCAN_STATUS_APP_ID and the scan-status-app-key secret;
         #   the App holds only Self-hosted runners: Read), it picks Spark when a runner with every Spark label is
         #   online and idle in a runner group that serves this repository. Missing credentials, an API error, or no
@@ -246,16 +247,23 @@ jobs:
           esac
 
           untrusted=""
-          if [ "$EVENT" = pull_request_target ]; then
-            untrusted="a pull_request_target event"
-          elif [ "$EVENT" = pull_request ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$REPO" ]; then
-            untrusted="a pull request from the fork $HEAD_REPO"
-          fi
+          case "$EVENT" in
+            pull_request_target) untrusted="a pull_request_target event" ;;
+            pull_request*)
+              if [ -z "$HEAD_REPO" ]; then
+                untrusted="a pull request whose head repository is gone (a deleted fork)"
+              elif [ "$HEAD_REPO" != "$REPO" ]; then
+                untrusted="a pull request from the fork $HEAD_REPO"
+              fi
+              ;;
+          esac
 
           placement=hosted
           reason=""
-          if [ -n "$untrusted" ] && [ "$mode" != hosted ]; then
+          if [ -n "$untrusted" ]; then
+            # Overrides cannot move this code onto Spark or any other self-hosted label.
             reason="$untrusted never runs on a self-hosted runner"
+            hosted_runner='"ubuntu-latest"'
             mode=none
           fi
           case "$mode" in

@@ -22,7 +22,8 @@ check run blocked the travelai-azure promotion of Rihla 9.27.
      between jobs.
    - Missing credentials, a failed API call, or every Spark runner offline or busy: GitHub-hosted. Every doubt
      falls toward the GitHub-hosted scan, never toward skipping it.
-   - A `pull_request_target` event or a pull request from a fork never runs on Spark, whatever the override says.
+   - A `pull_request_target` event, or a pull request whose head is a fork or a deleted fork, always scans on
+     `ubuntu-latest`. No override moves it to Spark or to any other self-hosted label.
 2. **"Image and SBOM (Trivy) on Spark"** runs only when the plan chose Spark. Each step that can stall on the
    runner has its own timeout: checkout 5 minutes, Trivy install 5, build `spark-build-minutes` (default 15,
    clamped to 1 to 30), SBOM 12, SBOM upload 5, scan 12. A stall or an infrastructure error ends the job
