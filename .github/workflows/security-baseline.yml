@@ -481,7 +481,8 @@ jobs:
       contents: read
     outputs:
       scanned: ${{ steps.result.outputs.scanned }}
-      findings: ${{ steps.scan.outputs.findings }}
+      # From the result step, which always succeeds: outputs written by the failing scan step do not reach the job.
+      findings: ${{ steps.result.outputs.findings }}
       stalled-at: ${{ steps.result.outputs.stalled-at }}
     env:
       # Unique per run: a self-hosted runner keeps images between jobs.
@@ -682,6 +683,7 @@ jobs:
           if [ "$SCAN" = failure ]; then
             # A finding: the job fails at the scan step, and the verdict job fails too.
             echo "scanned=true" >> "$GITHUB_OUTPUT"
+            echo "findings=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           at=scan
