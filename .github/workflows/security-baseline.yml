@@ -14,10 +14,17 @@ name: Security baseline
 # Light scans run on every pull request, on schedule and on manual runs (a push to the default branch
 # already passed them as a pull request; gitleaks still runs on every push): gitleaks (secrets, whole
 # history), osv-scanner (known vulnerabilities in lockfiles), Semgrep Community rules (p/default) and
-# a Trivy filesystem scan (vulnerabilities and misconfiguration). Heavy scans (image build, Trivy
+# a Trivy filesystem scan (vulnerabilities and misconfiguration), ShellCheck on every tracked shell script
+# (fails at error severity by default) and a vendored-file integrity check. Heavy scans (image build, Trivy
 # image scan and a CycloneDX SBOM uploaded as an artifact) run only when the repository has a
 # Dockerfile, and then only on a push to the default branch, on schedule or manual runs, and on pull
 # requests that change a Dockerfile, a manifest or a lockfile.
+#
+# The vendored-file check reads every VENDORED.json, labs.lock.json and sources.lock.json in the calling
+# repository and fails when a file they list no longer has its recorded SHA-256. It catches a hand edit of a
+# copied file (or a copy deleted without its manifest entry). It cannot tell whether a copy is behind its
+# source: that needs read access to the source repository, which a caller's CI token does not have, so
+# drift from the source is not checked by this workflow.
 #
 # The image scan runs on the self-hosted Spark scan runner when one is online for the repository, and
 # on GitHub-hosted otherwise or when Spark stalls; it is never skipped. The scan-status-app-key secret
@@ -70,6 +77,18 @@ on:
         default: ERROR
       trivy-fs:
         description: Run the Trivy filesystem scan.
+        type: boolean
+        default: true
+      shellcheck:
+        description: Run ShellCheck on every tracked shell script under the path (*.sh, *.bash, and files with a sh, bash or dash shebang).
+        type: boolean
+        default: true
+      shellcheck-severity:
+        description: Lowest ShellCheck severity that fails the check (error, warning, info or style).
+        type: string
+        default: error
+      vendored-check:
+        description: Check that every file listed in a VENDORED.json, labs.lock.json or sources.lock.json still has its recorded SHA-256.
         type: boolean
         default: true
       image:
@@ -138,6 +157,11 @@ env:
   TRIVY_VERSION: 0.76.0
   TRIVY_SHA256: e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7
   TRIVY_ARM64_SHA256: aab21e677a7b7071fc79f1711480840754c18a1b9d9cefa7ccd06af63a0e8f4c
+  # ShellCheck publishes no checksum file: these are the SHA-256 of the v0.11.0 release archives, taken on
+  # 22 November 2026.
+  SHELLCHECK_VERSION: 0.11.0
+  SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+  SHELLCHECK_ARM64_SHA256: 68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc
   # semgrep/semgrep:1.180.0, multi-architecture index digest.
   SEMGREP_IMAGE: semgrep/semgrep@sha256:529ee8a277ec8adc5b534d7c74eea0a47e9de21d62852b6ba7ac6ba9566845c3
 
@@ -184,10 +208,14 @@ jobs:
             auto)
               case "$EVENT" in
                 pull_request|pull_request_target)
-                  if gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' | grep -Eq "$pattern"; then
-                    heavy=true
+                  # The file list is captured before it is filtered: in a pipeline under pipefail, a failed gh api
+                  # call or a SIGPIPE from an early-exiting grep -q would read as "no image file changed". A list
+                  # that cannot be read falls toward running the heavy scans, never toward skipping them.
+                  if files="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename')"; then
+                    if grep -Eq "$pattern" <<< "$files"; then heavy=true; else heavy=false; fi
                   else
-                    heavy=false
+                    echo "::warning title=Pull request files unavailable::Could not list the files of pull request #${PR_NUMBER}; running the heavy scans."
+                    heavy=true
                   fi
                   ;;
                 push)
@@ -320,7 +348,7 @@ jobs:
                         selected)
                           repos="$(GH_TOKEN="$token" gh api --paginate "orgs/$ORG/actions/runner-groups/$gid/repositories?per_page=100" \
                             --jq '.repositories[].full_name')" || return 1
-                          if printf '%s\n' "$repos" | grep -Fxq "$REPO"; then allowed=yes; else allowed=no; fi
+                          if grep -Fxq "$REPO" <<< "$repos"; then allowed=yes; else allowed=no; fi
                           ;;
                         *) allowed=no ;;
                       esac
@@ -497,6 +525,224 @@ jobs:
         run: |
           "$RUNNER_TEMP/trivy" fs --scanners vuln,misconfig --severity "$SEVERITY" --ignore-unfixed \
             --exit-code 1 "$SCAN_PATH"
+
+  shellcheck:
+    name: Shell scripts (ShellCheck)
+    if: inputs.shellcheck && github.event_name != 'push'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install ShellCheck
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) arch=x86_64; sum="$SHELLCHECK_SHA256" ;;
+            aarch64|arm64) arch=aarch64; sum="$SHELLCHECK_ARM64_SHA256" ;;
+            *) echo "::error::no pinned ShellCheck build for $(uname -m)"; exit 1 ;;
+          esac
+          archive="shellcheck-v${SHELLCHECK_VERSION}.linux.${arch}.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${archive}"
+          echo "${sum}  $RUNNER_TEMP/${archive}" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" --strip-components=1 \
+            "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+      - name: Check shell scripts
+        # Checks every tracked *.sh and *.bash file under the path, and every other tracked file whose first line is
+        # a sh, bash or dash shebang. Symlinks are skipped (their target is checked where it is tracked). A
+        # repository with no shell script passes with a notice. Exceptions go in the script as a
+        # `# shellcheck disable=SCxxxx` comment with a reason, or in a .shellcheckrc.
+        env:
+          SCAN_PATH: ${{ inputs.path }}
+          SEVERITY: ${{ inputs.shellcheck-severity }}
+        run: |
+          set -euo pipefail
+          case "$SEVERITY" in
+            error|warning|info|style) ;;
+            *) echo "::error::shellcheck-severity must be error, warning, info or style, not '$SEVERITY'"; exit 1 ;;
+          esac
+          # The listing is written to a file first, so a git failure stops the step instead of reading as no files.
+          listing="$RUNNER_TEMP/shellcheck-candidates"
+          git ls-files -z -- "$SCAN_PATH" > "$listing"
+          shebang='^#!.*[/[:space:]](ba|da)?sh([[:space:]]|$)'
+          files=()
+          while IFS= read -r -d '' f; do
+            if [ -L "$f" ] || [ ! -f "$f" ]; then continue; fi
+            case "$f" in
+              *.sh|*.bash) files+=("$f"); continue ;;
+            esac
+            first="$(LC_ALL=C head -c 256 -- "$f" | LC_ALL=C tr -d '\000')"
+            first="${first%%$'\n'*}"
+            if [[ "$first" =~ $shebang ]]; then files+=("$f"); fi
+          done < "$listing"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::notice title=No shell scripts::No tracked shell script under '$SCAN_PATH'; ShellCheck has nothing to check."
+            echo "ShellCheck: no tracked shell script under '$SCAN_PATH'." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "ShellCheck ${SHELLCHECK_VERSION} at severity $SEVERITY on ${#files[@]} file(s)." >> "$GITHUB_STEP_SUMMARY"
+          "$RUNNER_TEMP/shellcheck" --severity="$SEVERITY" -- "${files[@]}"
+
+  vendored:
+    name: Vendored files (integrity)
+    if: inputs.vendored-check && github.event_name != 'push'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check vendored files against their manifests
+        # The checker is inlined because a calling repository cannot read files from alliwanlabs/.github. It reads
+        # every tracked VENDORED.json, labs.lock.json and sources.lock.json (outside node_modules, dist, .next and
+        # fixtures folders) and fails when a listed file is missing, has no recorded hash, or no longer has the
+        # SHA-256 its manifest records (exit 1), or when a manifest cannot be read or lists no file (exit 2). A
+        # first-line "Vendored from ...; do not edit here." header is left out of the hash, as labs-ui's vendor
+        # scripts record it. python3 -I keeps a module in the checked-out repository from shadowing the standard
+        # library.
+        run: |
+          set -euo pipefail
+          python3 -I - . <<'PY'
+          """Check that every vendored or mirrored file in a repository still matches the hash its manifest records.
+
+          Usage: check_vendored.py [repo-root]
+          Exit 0 when every listed file matches, 1 when any file is edited or missing, 2 when a manifest is unreadable.
+
+          Manifest formats read (all record sha256 of the file as vendored):
+            */VENDORED.json   {"files": {"rel/path": "sha256"}}                      paths relative to the manifest's folder
+            */VENDORED.json   {"rel/path": {"repo":..,"ref":..,"path":..,"sha256":..}} paths relative to the manifest's folder
+            labs.lock.json    {"modules": {"name": {"dir": "d", "files": {"f": "sha256"}}}} paths relative to repo root + dir
+            sources.lock.json {"files"|"sources": ...} any nested object with a "sha256" next to a local "path"/"dest"/"local"
+          """
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+          SKIP = ("node_modules/", "dist/", ".next/", ".git/")
+
+
+          def tracked():
+              try:
+                  out = subprocess.run(["git", "-C", str(root), "ls-files"], capture_output=True, text=True, check=True).stdout
+                  return [l for l in out.splitlines() if l]
+              except (OSError, subprocess.CalledProcessError):
+                  return [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()]
+
+
+          HEADER = re.compile(
+              r"^(?:/\* Vendored from .+; do not edit here\. \*/|<!-- Vendored from .+; do not edit here\. -->|# Vendored from .+; do not edit here\.)\r?$"
+          )
+
+
+          def sha(p):
+              """sha256 of the file body after a provenance header line, as labs-ui's vendor scripts record it."""
+              data = p.read_bytes()
+              nl = data.find(b"\n")
+              if nl != -1:
+                  try:
+                      first = data[:nl].decode()
+                  except UnicodeDecodeError:
+                      first = ""
+                  if HEADER.match(first):
+                      data = data[nl + 1 :]
+              return hashlib.sha256(data).hexdigest()
+
+
+          def entries(manifest_rel, data):
+              base = (root / manifest_rel).parent
+              name = Path(manifest_rel).name
+              if name == "sources.lock.json" and any(isinstance(v, dict) and "sha256" in v for v in data.values()):
+                  # labs-library keeps its copies under items/ (scripts/sync_sources.py)
+                  lib = base / "items" if (base / "items").is_dir() else base
+                  for rel, v in data.items():
+                      if isinstance(v, dict) and "sha256" in v:
+                          yield lib / rel, v["sha256"]
+              elif name == "VENDORED.json":
+                  files = data.get("files") if isinstance(data.get("files"), dict) else None
+                  if files is not None:
+                      for rel, h in files.items():
+                          yield base / rel, h if isinstance(h, str) else (h or {}).get("sha256")
+                  else:
+                      for rel, v in data.items():
+                          if isinstance(v, dict) and "sha256" in v:
+                              yield base / rel, v["sha256"]
+              elif name == "labs.lock.json":
+                  for mod in (data.get("modules") or {}).values():
+                      if not isinstance(mod, dict) or not mod.get("installed", True):
+                          continue
+                      d = root / (mod.get("dir") or "")
+                      for rel, h in (mod.get("files") or {}).items():
+                          yield d / rel, h
+              else:
+                  def walk(o):
+                      if isinstance(o, dict):
+                          local = o.get("local") or o.get("dest") or o.get("path")
+                          if isinstance(o.get("sha256"), str) and isinstance(local, str):
+                              yield base / local, o["sha256"]
+                          for k, v in o.items():
+                              if isinstance(v, str) and len(v) == 64 and all(c in "0123456789abcdef" for c in v) and "/" in k or (isinstance(v, str) and len(v) == 64 and k.endswith((".py", ".ts", ".tsx", ".js", ".css", ".json", ".md", ".mjs", ".html"))):
+                                  yield base / k, v
+                              elif isinstance(v, (dict, list)):
+                                  yield from walk(v)
+                      elif isinstance(o, list):
+                          for v in o:
+                              yield from walk(v)
+                  yield from walk(data)
+
+
+          def main():
+              manifests = [f for f in tracked() if Path(f).name in ("VENDORED.json", "labs.lock.json", "sources.lock.json") and not f.startswith(SKIP) and "/fixtures/" not in f and not f.startswith("fixtures/")]
+              if not manifests:
+                  print("::notice title=No vendoring manifest::No VENDORED.json, labs.lock.json or sources.lock.json in this repository; nothing to check.")
+                  return 0
+              bad, checked, unreadable = [], 0, False
+              for m in manifests:
+                  try:
+                      data = json.loads((root / m).read_text())
+                  except (OSError, ValueError) as exc:
+                      print(f"UNREADABLE {m}: {exc}")
+                      unreadable = True
+                      continue
+                  n = 0
+                  for path, h in entries(m, data):
+                      n += 1
+                      rel = path.relative_to(root) if path.is_relative_to(root) else path
+                      if not h:
+                          bad.append(f"NO HASH  {rel}  ({m})")
+                      elif not path.is_file():
+                          bad.append(f"MISSING  {rel}  ({m})")
+                      elif sha(path) != h.removeprefix("sha256:"):
+                          bad.append(f"EDITED   {rel}  ({m})")
+                  if n == 0:
+                      print(f"UNREADABLE {m}: no file entries found; the checker does not understand this manifest")
+                      unreadable = True
+                  checked += n
+                  print(f"{m}: {n} files")
+              for b in bad:
+                  print(b)
+              print(f"checked={checked} problems={len(bad)}")
+              if unreadable:
+                  print("::error title=Vendoring manifest unreadable::A vendoring manifest could not be read or lists no file; see the lines above.")
+                  return 2
+              if bad:
+                  print("::error title=Vendored file changed::A vendored file is missing or differs from the hash its manifest records. Fix it at its source and vendor it again; never edit the copy.")
+                  return 1
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
 
   # The image scan runs in up to two jobs, so that a stalled or missing Spark scan runner never blocks a release
   # and never skips the scan:
