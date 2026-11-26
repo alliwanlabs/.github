@@ -158,6 +158,13 @@ if [ "${NEGATIVE_SCANNERS:-0}" = 1 ]; then
   # Exit 1 is "findings" under --error; Semgrep's own errors exit 2 or more, so they cannot pass this case.
   check "semgrep: findings fail the check" 1 '' '' \
     in_dir "$vuln" env SCAN_PATH=. CONFIG=p/default SEVERITY=INFO EXCLUDE_RULES= "$step" semgrep "Scan"
+  # The WARNING report never fails: it lists WARNING findings (eval, pickle) and not the ERROR one (shell=True), and
+  # when Semgrep cannot run (a rule set that does not exist) it warns and still passes.
+  check "semgrep warnings: WARNING findings are listed and the check passes" 0 \
+    'WARNING app\.py:7 .*eval-detected' 'subprocess-shell-true' \
+    in_dir "$vuln" env SCAN_PATH=. CONFIG=p/default EXCLUDE_RULES= "$step" semgrep-warnings "Report WARNING findings"
+  check "semgrep warnings: a Semgrep that cannot run still passes, with a warning" 0 'Semgrep warnings not reported' '' \
+    in_dir "$vuln" env SCAN_PATH=. CONFIG=p/no-such-ruleset EXCLUDE_RULES= "$step" semgrep-warnings "Report WARNING findings"
 else
   echo "SKIP  scanner cases (set NEGATIVE_SCANNERS=1 to run them; self-check does)"
 fi

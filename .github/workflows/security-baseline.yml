@@ -13,7 +13,8 @@ name: Security baseline
 #
 # Light scans run on every pull request, on schedule and on manual runs (a push to the default branch
 # already passed them as a pull request; gitleaks still runs on every push): gitleaks (secrets, whole
-# history), osv-scanner (known vulnerabilities in lockfiles), Semgrep Community rules (p/default) and
+# history), osv-scanner (known vulnerabilities in lockfiles), Semgrep Community rules (p/default; ERROR
+# findings fail the check, and WARNING findings are listed by a report-only job that never fails) and
 # a Trivy filesystem scan (vulnerabilities and misconfiguration), ShellCheck on every tracked shell script
 # (fails at error severity by default) and a vendored-file integrity check. Heavy scans (image build, Trivy
 # image scan and a CycloneDX SBOM uploaded as an artifact) run only when the repository has a
@@ -75,6 +76,12 @@ on:
         description: Lowest Semgrep severity that fails the check (INFO, WARNING or ERROR).
         type: string
         default: ERROR
+      semgrep-warnings:
+        description: >-
+          Report Semgrep WARNING findings in a separate job that never fails ("Static analysis warnings (Semgrep,
+          report only)"). Runs only while semgrep-severity is ERROR. A one-week trial, to be reviewed on 2 December 2026.
+        type: boolean
+        default: true
       trivy-fs:
         description: Run the Trivy filesystem scan.
         type: boolean
@@ -496,6 +503,82 @@ jobs:
           esac
           docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
             semgrep scan --config "$CONFIG" --metrics=off --error "${levels[@]}" "${excludes[@]}" "$SCAN_PATH"
+
+  semgrep-warnings:
+    # Report only: the WARNING findings that "Static analysis (Semgrep)" does not fail on at its ERROR threshold,
+    # listed in the job summary and the log, so they can be seen before anyone decides whether WARNING should block.
+    # A one-week trial, to be reviewed on 2 December 2026. This job never fails: both steps continue on error, the
+    # scan script always exits 0, and the step timeouts end well inside the job's. Its check name is new, so no
+    # existing or required check name changes.
+    name: Static analysis warnings (Semgrep, report only)
+    if: inputs.semgrep && inputs.semgrep-warnings && inputs.semgrep-severity == 'ERROR' && github.event_name != 'push'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+      - name: Report WARNING findings
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 12
+        env:
+          SCAN_PATH: ${{ inputs.path }}
+          CONFIG: ${{ inputs.semgrep-config }}
+          EXCLUDE_RULES: ${{ inputs.semgrep-exclude-rules }}
+        run: |
+          # The runner's default shell is bash -e: errexit is switched off, so no command here ends the step red.
+          set +e
+          set -uo pipefail
+          report="$RUNNER_TEMP/semgrep-warnings.json"
+          excludes=()
+          while IFS= read -r rule; do
+            if [ -n "$rule" ]; then excludes+=(--exclude-rule "$rule"); fi
+          done <<< "$EXCLUDE_RULES"
+          # Same image, rules and exclusions as the blocking scan, at WARNING only. Without --error, Semgrep exits 0
+          # with findings and non-zero only when it cannot run.
+          docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan --config "$CONFIG" --metrics=off --severity WARNING "${excludes[@]}" --json "$SCAN_PATH" \
+            > "$report"
+          rc=$?
+          if [ "$rc" -ne 0 ] || ! jq -e '.results | type == "array"' "$report" > /dev/null 2>&1; then
+            echo "::warning title=Semgrep warnings not reported::Semgrep did not finish (exit $rc), so there is no WARNING report. This check passes anyway; ERROR findings are checked by \"Static analysis (Semgrep)\"."
+            echo "Semgrep did not finish (exit $rc): no WARNING report." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Paths come from the scanned repository: control characters are replaced, so no line of this log can
+          # start a workflow command.
+          clean='gsub("[[:cntrl:]]"; "?")'
+          total="$(jq '.results | length' "$report")"
+          rules="$(jq '[.results[].check_id] | unique | length' "$report")"
+          echo "Semgrep WARNING report: $total findings from $rules rules. Report only: this check does not fail on them."
+          jq -r ".results[] | \"WARNING \(.path | $clean):\(.start.line) \(.check_id)\"" "$report"
+          {
+            echo "### Semgrep WARNING findings (report only)"
+            echo
+            echo "$total findings from $rules rules. This check does not fail on them; ERROR findings fail \"Static analysis (Semgrep)\"."
+            if [ "$total" -gt 0 ]; then
+              echo
+              echo "| Rule | Findings |"
+              echo "|---|---|"
+              jq -r '[.results[].check_id] | group_by(.) | map({rule: .[0], n: length}) | sort_by(-.n, .rule)[] | "| `\(.rule)` | \(.n) |"' "$report"
+              echo
+              echo "<details><summary>Where (first 200)</summary>"
+              echo
+              jq -r ".results[:200][] | \"- \`\(.path | $clean):\(.start.line)\` \(.check_id)\"" "$report"
+              echo
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$total" -gt 0 ]; then
+            echo "::notice title=Semgrep warnings (report only)::$total WARNING findings from $rules rules, listed in the job summary. This check does not fail on them."
+          fi
+          exit 0
 
   trivy-fs:
     name: Filesystem (Trivy)
