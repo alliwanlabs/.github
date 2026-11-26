@@ -85,9 +85,10 @@ jobs:
 
   negatives:
     # Each check must also fail on input it has to reject: a pull request whose file list cannot be read must run
-    # the heavy scans; a broken shell script, an edited vendored file, a committed token, a vulnerable pinned
-    # package and a Semgrep finding must each fail their check. The cases run the steps' own scripts from
-    # security-baseline.yml (tests/negative/run-step.sh) on input built at run time.
+    # the heavy scans; a broken shell script, an edited vendored file, a committed token, an Azure Storage key, a
+    # signed URL, a password in a database URL, a vulnerable pinned package and a Semgrep finding must each fail
+    # their check. The cases run the steps' own scripts from security-baseline.yml (tests/negative/run-step.sh) on
+    # input built at run time.
     name: Checks fail on bad input
     runs-on: ubuntu-latest
     timeout-minutes: 20
