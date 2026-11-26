@@ -6,6 +6,7 @@
 # Cases that need only bash, git, gh and python3 always run. The scanner cases (gitleaks, osv-scanner, Semgrep,
 # Trivy) download the pinned Linux scanners and need Docker, so they run only with NEGATIVE_SCANNERS=1 (self-check
 # sets it). LOCAL_SHELLCHECK=<path> uses that binary in place of the pinned download, for a run on a laptop.
+# LOCAL_GITLEAKS=<path> does the same for gitleaks and runs the gitleaks rule cases without the other scanners.
 #
 # Exit 0 when every case behaved as expected, 1 when any did not (each failure is listed at the end).
 set -euo pipefail
@@ -160,6 +161,69 @@ if [ "${NEGATIVE_SCANNERS:-0}" = 1 ]; then
     in_dir "$vuln" env SCAN_PATH=. CONFIG=p/default SEVERITY=INFO EXCLUDE_RULES= "$step" semgrep "Scan"
 else
   echo "SKIP  scanner cases (set NEGATIVE_SCANNERS=1 to run them; self-check does)"
+fi
+
+# --- gitleaks: the organisation's own rules -------------------------------------------------------------------
+# The org default config adds three rules that gitleaks' own rules lack: Azure Storage account keys, SAS and Power
+# Automate signed URLs (sig=), and passwords in database or broker URLs, also with an empty user name. Every value
+# is made up at run time and was never issued, and no line here matches a rule, so this repository's own scan
+# stays clean. A case passes only when its own rule fires: the rule IDs come from a report of the same scan, made
+# with the config the step wrote.
+if [ "${NEGATIVE_SCANNERS:-0}" = 1 ] || [ -n "${LOCAL_GITLEAKS:-}" ]; then
+  if [ -n "${LOCAL_GITLEAKS:-}" ]; then
+    cp "$LOCAL_GITLEAKS" "$RUNNER_TEMP/gitleaks"
+  elif [ ! -x "$RUNNER_TEMP/gitleaks" ]; then
+    "$step" gitleaks "Install gitleaks"
+  fi
+
+  # planted <name> <printf format> <value>: a new repository whose one commit adds settings.txt, holding the
+  # formatted line; prints its path.
+  planted() {
+    local d
+    d="$(new_repo "$1")"
+    # shellcheck disable=SC2059 # the format is the case's own fixture line
+    printf "$2" "$3" > "$d/settings.txt"
+    commit_all "$d"
+    printf '%s\n' "$d"
+  }
+
+  # leak_rules <repo>: runs the gitleaks step on the repository with the org default config and exits with its
+  # code, then prints the rule ID of each finding. Values stay redacted.
+  leak_rules() {
+    local rc=0
+    (cd "$1" && CONFIG='' "$step" gitleaks "Scan the whole history") || rc=$?
+    "$RUNNER_TEMP/gitleaks" git --no-banner --redact=100 --log-level error --config "$RUNNER_TEMP/gitleaks.toml" \
+      --report-format json --report-path "$work/gitleaks-report.json" "$1" > /dev/null 2>&1 || true
+    jq -r '.[].RuleID' "$work/gitleaks-report.json"
+    return "$rc"
+  }
+
+  key="$(openssl rand -base64 64 | tr -d '\n')"
+  sig="$(openssl rand -base64 33 | tr -d '\n' | tr '+/' '-_')"
+  pass="$(openssl rand -hex 12)"
+
+  repo="$(planted azure-key \
+    'DefaultEndpointsProtocol=https;AccountName=notarealaccount;AccountKey=%s;EndpointSuffix=core.windows.net\n' "$key")"
+  check "gitleaks: an Azure Storage account key fails on its own rule" nonzero '^azure-storage-account-key$' '' \
+    leak_rules "$repo"
+  repo="$(planted azure-sas 'https://notarealaccount.blob.core.windows.net/c/f.txt?sv=2022-11-02&sp=r&sig=%s\n' "$sig")"
+  check "gitleaks: a signed URL (sig=) fails on its own rule" nonzero '^azure-sas-signature$' '' \
+    leak_rules "$repo"
+  repo="$(planted db-url 'DATABASE_URL=postgresql://app:%s@db.example.invalid:5432/app\n' "$pass")"
+  check "gitleaks: a password in a database URL fails on its own rule" nonzero '^connection-string-password$' '' \
+    leak_rules "$repo"
+  repo="$(planted db-url-no-user 'REDIS_URL=redis://:%s@cache.example.invalid:6379/0\n' "$pass")"
+  check "gitleaks: a password in a URL with an empty user name fails" nonzero '^connection-string-password$' '' \
+    leak_rules "$repo"
+  # One URL per argument, so this file never has two URLs in one string: the rule's password part would run on to
+  # the later URL's @, and this repository's own scan would fail.
+  repo="$(new_repo db-url-clean)"
+  # shellcheck disable=SC2016 # the ${...} placeholders are fixture text, not expansions
+  printf '%s\n' 'DATABASE_URL=postgresql://db.example.invalid:5432/app' 'REDIS_URL=redis://cache.example.invalid:6379/0' \
+    'DATABASE_URL=postgresql://${PGUSER}:${PGPASSWORD}@db.example.invalid:5432/app' > "$repo/settings.txt"
+  commit_all "$repo"
+  check "gitleaks: database URLs with no password, or a placeholder, pass" 0 '' '' \
+    leak_rules "$repo"
 fi
 
 if [ "${#failures[@]}" -gt 0 ]; then
